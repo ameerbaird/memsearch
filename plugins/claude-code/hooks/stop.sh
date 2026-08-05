@@ -97,6 +97,17 @@ with open(sys.argv[1], encoding='utf-8', errors='replace') as f:
 print(uuid)
 " "$TRANSCRIPT_PATH" 2>/dev/null || true)
 
+# Per-turn dedup: if this turn's UUID is already anchored in today's memory
+# file, the Stop hook has already summarized+appended this exact turn. Skip
+# the expensive `claude -p` summarize call AND the append entirely so we
+# don't duplicate summaries (or burn Haiku tokens) on repeat Stop firings
+# for the same turn. Preserves the existing session-heading dedup below.
+if [ -n "$LAST_USER_TURN_UUID" ] && \
+   grep -qF "turn:${LAST_USER_TURN_UUID}" "$MEMORY_FILE" 2>/dev/null; then
+  echo '{}'
+  exit 0
+fi
+
 # Load summarization prompt: user custom (via config) > plugin built-in template
 AGENT_NAME="Claude Code"
 PROMPT_FILE=""
