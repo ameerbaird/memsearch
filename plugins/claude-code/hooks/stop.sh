@@ -88,7 +88,7 @@ with open(sys.argv[1], encoding='utf-8', errors='replace') as f:
     for line in f:
         try:
             obj = json.loads(line)
-            if obj.get('type') != 'user' or obj.get('isMeta'):
+            if obj.get('type') != 'user' or (obj.get('isMeta') and (obj.get('origin') or {}).get('kind') != 'channel'):
                 continue
             content = obj.get('message', {}).get('content')
             if isinstance(content, str) and content.strip():
@@ -102,6 +102,26 @@ with open(sys.argv[1], encoding='utf-8', errors='replace') as f:
         except: pass
 print(uuid)
 " "$TRANSCRIPT_PATH" 2>/dev/null || true)
+
+# Per-turn dedup (#711, #861.04): one memory entry per user turn. The lock is
+# held from here through the append, so two Stop firings for the same turn
+# cannot both pass the check during the slow summarize call.
+if [ -n "$LAST_USER_TURN_UUID" ]; then
+  TURN_LOCK_DIR="$(dirname "$MEMORY_DIR")/.turn-locks"
+  mkdir -p "$TURN_LOCK_DIR" 2>/dev/null || true
+  if command -v flock &>/dev/null && [ -w "$TURN_LOCK_DIR" ] && [[ "$LAST_USER_TURN_UUID" =~ ^[0-9A-Fa-f-]+$ ]]; then
+    find "$TURN_LOCK_DIR" -name '*.lock' -mmin +1440 -delete 2>/dev/null || true
+    exec 9>"$TURN_LOCK_DIR/$LAST_USER_TURN_UUID.lock"
+    if ! flock -n 9; then
+      echo '{}'
+      exit 0
+    fi
+  fi
+  if grep -qF "turn:${LAST_USER_TURN_UUID}" "$MEMORY_FILE" 2>/dev/null; then
+    echo '{}'
+    exit 0
+  fi
+fi
 
 # Load summarization prompt: user custom (via config) > plugin built-in template
 AGENT_NAME="Claude Code"

@@ -41,7 +41,7 @@ def find_last_turn_start(lines):
     for i in range(len(lines) - 1, -1, -1):
         try:
             obj = json.loads(lines[i])
-            if obj.get("type") == "user" and not obj.get("isMeta"):
+            if obj.get("type") == "user" and (not obj.get("isMeta") or (obj.get("origin") or {}).get("kind") == "channel"):
                 content = obj.get("message", {}).get("content")
                 if isinstance(content, str) and content.strip():
                     return i
