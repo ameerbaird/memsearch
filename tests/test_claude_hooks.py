@@ -1522,6 +1522,12 @@ esac
     assert memory_text.count("### 12:34") == 1
     assert memory_text.count("session:session-a ") == 1
 
+    # Fork (#861.04): Stop on the same turn again is a no-op (per-turn dedup).
+    run_stop(transcript_a)
+    assert memory_file.read_text(encoding="utf-8") == memory_text
+
+    # A new turn in the same session groups under the same session heading.
+    _write_claude_transcript(transcript_a, turn_uuid="turn-a2")
     run_stop(transcript_a)
     memory_text = memory_file.read_text(encoding="utf-8")
     assert memory_text.count("## Session 12:34") == 1
