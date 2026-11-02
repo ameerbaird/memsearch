@@ -6,15 +6,16 @@ This page explains the technical architecture and key implementation decisions b
 
 ## Cross-Platform Memory Sharing
 
-memsearch supports 4 AI coding agent platforms: [Claude Code](platforms/claude-code/index.md), [OpenClaw](platforms/openclaw/index.md), [OpenCode](platforms/opencode/index.md), and [Codex CLI](platforms/codex/index.md). All plugins write to the same markdown format and use the same Milvus index, making memories portable across platforms.
+memsearch supports 5 AI coding agent platforms: [Claude Code](platforms/claude-code/index.md), [Codex](platforms/codex/index.md), [DeepSeek Harness](platforms/dsh/index.md), [OpenClaw](platforms/openclaw/index.md), and [OpenCode](platforms/opencode/index.md). All plugins write to the same markdown format and use the same Milvus index, making memories portable across platforms.
 
 ```mermaid
 graph TB
     subgraph "Capture (per-platform)"
         CC["Claude Code<br/>(Stop hook + Haiku)"]
+        CX["Codex<br/>(Stop hook + Codex)"]
+        DSH["DeepSeek Harness<br/>(turn event + headless agent)"]
         OC["OpenClaw<br/>(agent_end)"]
-        OO["OpenCode<br/>(SQLite daemon)"]
-        CX["Codex CLI<br/>(Stop hook + Codex)"]
+        OO["OpenCode<br/>(session events + SQLite)"]
     end
 
     subgraph "Shared Memory"
@@ -22,7 +23,7 @@ graph TB
         MIL[("Milvus<br/>(shared index)")]
     end
 
-    CC & OC & OO & CX --> MD
+    CC & CX & DSH & OC & OO --> MD
     MD --> MIL
 
     style MD fill:#2a3a5c,stroke:#e0976b,color:#a8b2c1
@@ -51,6 +52,13 @@ graph LR
         RRF
     end
 ```
+
+When an optional reranker is configured, search fetches up to `3 * top_k`
+candidates from this RRF stage, then applies a local cross-encoder or remote
+[Jev reranker](home/configuration.md#optional-remote-reranking) and returns the
+best `top_k` results. Jev receives the query and candidate contents in one
+batched API request; the RRF fusion stage still runs first. This second stage
+is disabled by default.
 
 ### Ingest Flow
 
@@ -232,7 +240,7 @@ graph TD
 
 ### Physical Isolation
 
-Each platform plugin derives a collection name from the project path (e.g., `ms_claude_code_myproject`). This keeps memories from different projects separate within the same Milvus instance, avoiding the complexity of multi-tenant collection management while keeping the schema simple.
+Each platform plugin derives a collection name from the project path (e.g., `ms_claude_code_myproject`) and supplies it as a low-priority integration default. This keeps memories from different projects, including linked worktrees in different directories, separate within the same Milvus instance. An explicit collection in project/global config or the current call overrides that default, allowing intentional sharing without automatic scope merging.
 
 ---
 
@@ -260,7 +268,7 @@ graph LR
 | **L2: Expand** | Full markdown section around a chunk, including anchor metadata | Medium -- one file section |
 | **L3: Transcript** | Original conversation turns verbatim (user messages, assistant responses, tool calls) | High -- raw dialogue |
 
-The L3 transcript format varies by platform (Claude Code JSONL, OpenClaw JSONL, OpenCode SQLite, Codex rollout JSONL), but the L1/L2 layers are shared across all platforms via the `memsearch` CLI.
+The L3 transcript format varies by platform (Claude Code JSONL, Codex rollout JSONL, DSH session database, OpenClaw JSONL, OpenCode SQLite), but the L1/L2 layers are shared across all platforms via the `memsearch` CLI.
 
 **Session anchors** in memory files enable the L2-to-L3 bridge:
 
@@ -276,21 +284,23 @@ The L3 transcript format varies by platform (Claude Code JSONL, OpenClaw JSONL, 
 
 ## Configuration System
 
-memsearch uses a 4-layer configuration system. Each layer overrides the one before it:
+memsearch uses a 5-layer configuration system. Each layer overrides the one before it:
 
 ```mermaid
 graph LR
-    D["1. Defaults"] --> G["2. Global Config<br>~/.memsearch/config.toml"]
-    G --> P["3. Project Config<br>.memsearch.toml"]
-    P --> C["4. CLI Flags<br>--milvus-uri, etc."]
+    D["1. Defaults"] --> I["2. Integration Defaults<br>derived collection"]
+    I --> G["3. Global Config<br>~/.memsearch/config.toml"]
+    G --> P["4. Project Config<br>.memsearch.toml"]
+    P --> C["5. Explicit Call/CLI<br>--collection, etc."]
 ```
 
 | Priority | Source | Scope | Example |
 |----------|--------|-------|---------|
 | 1 (lowest) | Built-in defaults | Hardcoded | `milvus.uri = ~/.memsearch/milvus.db` |
-| 2 | `~/.memsearch/config.toml` | User-global | Shared across all projects |
-| 3 | `.memsearch.toml` | Per-project | Committed to the repo or gitignored |
-| 4 (highest) | CLI flags | Per-command | `--milvus-uri http://...` |
+| 2 | Integration defaults | Caller context | A plugin's directory-derived collection |
+| 3 | `~/.memsearch/config.toml` | User-global | Shared across all projects |
+| 4 | `.memsearch.toml` | Per-project | Committed to the repo or gitignored |
+| 5 (highest) | Explicit call or CLI overrides | Per-command | `--milvus-uri http://...` |
 
 > **Note:** API keys for embedding and LLM providers (e.g. `OPENAI_API_KEY`, `GOOGLE_API_KEY`) are read from environment variables by their respective SDKs. They are not part of the memsearch configuration system and are never written to config files.
 

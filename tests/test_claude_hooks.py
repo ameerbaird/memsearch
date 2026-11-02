@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import shutil
+import signal
 import subprocess
+import sys
+import time
 from pathlib import Path
+
+import pytest
 
 
 def _write_executable(path: Path, source: str) -> None:
@@ -28,6 +35,204 @@ def _write_claude_transcript(path: Path, *, turn_uuid: str) -> None:
         + "\n",
         encoding="utf-8",
     )
+
+
+@pytest.fixture
+def claude_python_env(tmp_path: Path) -> dict[str, str]:
+    """Simulate Git Bash with controlled Python commands and optional jq."""
+    if os.name != "posix":
+        pytest.skip("uses POSIX executable symlinks to simulate Git Bash")
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    store = tmp_path / "WindowsApps"
+    home.mkdir()
+    fake_bin.mkdir()
+    store.mkdir()
+    for name in (
+        "bash",
+        "cat",
+        "timeout",
+        "perl",
+        "dirname",
+        "git",
+        "basename",
+        "tr",
+        "sed",
+        "cut",
+        "sha256sum",
+        "date",
+        "wc",
+        "grep",
+        "mkdir",
+        "find",
+        "realpath",
+    ):
+        if executable := shutil.which(name):
+            (fake_bin / name).symlink_to(executable)
+    # Mask any interpreters in the user bin paths added by common.sh as well.
+    for name in ("python3", "python", "py"):
+        _write_executable(store / name, "#!/bin/sh\necho 'Python was not found' >&2\nexit 49\n")
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/bin/sh
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  case "$3" in
+    embedding.provider) echo onnx ;;
+    milvus.uri) echo "${MEMSEARCH_TEST_MILVUS_URI:-http://localhost:19530}" ;;
+  esac
+fi
+exit 0
+""",
+    )
+    return {
+        **os.environ,
+        "HOME": str(home),
+        # Keep this last so common.sh does not prepend it ahead of the stubs.
+        "PATH": os.pathsep.join([str(fake_bin), str(store), "/usr/local/bin"]),
+        "CLAUDE_PLUGIN_ROOT": str(Path("plugins/claude-code").resolve()),
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(tmp_path / ".memsearch"),
+        "MEMSEARCH_NO_WATCH": "1",
+        "MEMSEARCH_TEST_PYTHON": sys.executable,
+    }
+
+
+@pytest.mark.parametrize("with_jq", [False, True], ids=["without-jq", "with-jq"])
+@pytest.mark.parametrize("interpreter", ["python3", "python", "py", "py-after-python2"])
+def test_claude_hooks_capture_with_working_python(
+    tmp_path: Path, claude_python_env: dict[str, str], interpreter: str, with_jq: bool
+) -> None:
+    env = claude_python_env
+    fake_bin = tmp_path / "bin"
+    install = tmp_path / "Python Install"
+    install.mkdir()
+    env["PATH"] = f"{install}{os.pathsep}{env['PATH']}"
+    if with_jq:
+        if not (jq := shutil.which("jq")):
+            pytest.skip("jq is not installed")
+        (fake_bin / "jq").symlink_to(jq)
+    if interpreter == "py-after-python2":
+        _write_executable(
+            install / "python",
+            '#!/bin/sh\nexec "$MEMSEARCH_TEST_PYTHON" -c '
+            "'import sys; sys.version_info = (2, 7); exec(sys.argv[1])' \"$2\"\n",
+        )
+    if interpreter in {"py", "py-after-python2"}:
+        _write_executable(
+            install / "py",
+            '#!/bin/sh\n[ "$1" = "-3" ] || exit 1\nshift\nexec "$MEMSEARCH_TEST_PYTHON" "$@"\n',
+        )
+    else:
+        (install / interpreter).symlink_to(sys.executable)
+    _write_executable(
+        fake_bin / "claude",
+        '#!/bin/sh\n[ "${1:-}" = "--help" ] && exit 0\ncat >/dev/null\necho "- User discussed Python detection."\n',
+    )
+    transcript = tmp_path / "session-python.jsonl"
+    _write_claude_transcript(transcript, turn_uuid="turn-python")
+
+    result = subprocess.run(
+        ["bash", "plugins/claude-code/hooks/stop.sh"],
+        input=json.dumps({"transcript_path": str(transcript)}),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    assert result.stdout.strip() == "{}"
+    assert result.stderr == ""
+    journals = list((tmp_path / ".memsearch" / "memory").glob("*.md"))
+    assert len(journals) == 1
+    journal = journals[0].read_text(encoding="utf-8")
+    assert "User discussed Python detection." in journal
+    assert "turn:turn-python" in journal
+
+    # The parser is also a standalone helper, without common.sh's setup.
+    parsed = subprocess.run(
+        ["bash", "plugins/claude-code/hooks/parse-transcript.sh", str(transcript)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    assert "[User]: Summarize this session" in parsed.stdout
+    hint = subprocess.run(
+        ["bash", "plugins/claude-code/hooks/user-prompt-submit.sh"],
+        input=json.dumps({"prompt": "Explain how Python detection works in these hooks."}),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    assert "Recall available if needed" in json.loads(hint.stdout)["systemMessage"]
+
+
+@pytest.mark.parametrize("with_jq", [False, True], ids=["without-jq", "with-jq"])
+def test_claude_session_start_reports_missing_python(
+    tmp_path: Path, claude_python_env: dict[str, str], with_jq: bool
+) -> None:
+    if with_jq:
+        if not (jq := shutil.which("jq")):
+            pytest.skip("jq is not installed")
+        (tmp_path / "bin" / "jq").symlink_to(jq)
+    # The diagnostic must remain valid JSON even with a Windows backend path.
+    claude_python_env["MEMSEARCH_TEST_MILVUS_URI"] = r'C:\Users\Jane "Doe"\milvus.db'
+    result = subprocess.run(
+        ["bash", "plugins/claude-code/hooks/session-start.sh"],
+        capture_output=True,
+        text=True,
+        env=claude_python_env,
+        check=True,
+    )
+    assert result.stderr == ""
+    status = json.loads(result.stdout)["systemMessage"]
+    assert "ERROR: no working Python 3 found" in status
+    assert "memory capture disabled" in status
+
+
+def _run_claude_session_start_with_memory(tmp_path: Path, journals: dict[str, str]) -> str:
+    script = Path("plugins/claude-code/hooks/session-start.sh")
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    memory = tmp_path / ".memsearch" / "memory"
+    home.mkdir()
+    fake_bin.mkdir()
+    (home / ".memsearch").mkdir()
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+    memory.mkdir(parents=True)
+
+    for name, content in journals.items():
+        (memory / name).write_text(content, encoding="utf-8")
+
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"onnx","model":"","api_key":""},"milvus":{"uri":"http://localhost:19530"}}'
+  exit 0
+fi
+exit 0
+""",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(tmp_path / ".memsearch"),
+        "MEMSEARCH_NO_WATCH": "1",
+    }
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+    payload = json.loads(result.stdout)
+    return payload.get("hookSpecificOutput", {}).get("additionalContext", "")
 
 
 def test_claude_hook_memsearch_disable_exits_before_writing_memory(tmp_path: Path) -> None:
@@ -199,6 +404,108 @@ exit 0
     assert "Session 09:02" not in context
 
 
+def test_claude_session_start_recent_memory_keeps_latest_entries_within_budget(tmp_path: Path) -> None:
+    filler = "x" * 180
+    journal = "\n".join(
+        [
+            "# 2026-08-19",
+            "",
+            "## Session 09:00",
+            "### 09:00",
+            "- OLDEST_ENTRY",
+            *[f"- {filler}-{index}" for index in range(30)],
+            "",
+            "## Session 17:00",
+            "### 17:00",
+            "- LATEST_ENTRY",
+            "",
+        ]
+    )
+
+    context = _run_claude_session_start_with_memory(tmp_path, {"2026-08-19.md": journal})
+
+    assert "LATEST_ENTRY" in context
+    assert "OLDEST_ENTRY" not in context
+    assert len(context.encode("utf-8")) <= 1800
+
+
+def test_claude_session_start_recent_memory_prioritizes_newest_journal(tmp_path: Path) -> None:
+    filler = "x" * 180
+    newest = "\n".join(
+        [
+            "# 2026-08-19",
+            "",
+            "## Session 17:00",
+            "### 17:00",
+            *[f"- {filler}-{index}" for index in range(20)],
+            "- TODAY_LATEST_MARKER",
+            "",
+        ]
+    )
+    older_filler = "x" * 180
+    older = f"""# 2026-08-18
+
+## Session 17:00
+### 17:00
+- OLD_DAY_MARKER {older_filler}
+"""
+
+    context = _run_claude_session_start_with_memory(
+        tmp_path,
+        {"2026-08-18.md": older, "2026-08-19.md": newest},
+    )
+
+    assert "TODAY_LATEST_MARKER" in context
+    assert "OLD_DAY_MARKER" not in context
+    assert len(context.encode("utf-8")) <= 1800
+
+
+def test_claude_session_start_does_not_fall_back_when_newest_entry_exceeds_budget(tmp_path: Path) -> None:
+    newest = "\n".join(
+        [
+            "# 2026-08-19",
+            "",
+            "## Session 17:00",
+            "### 17:00",
+            f"- NEWEST_OVERSIZED_ENTRY {'x' * 2000}",
+            "",
+        ]
+    )
+    older = """# 2026-08-18
+
+## Session 16:00
+### 16:00
+- OLD_DAY_MARKER
+"""
+
+    context = _run_claude_session_start_with_memory(
+        tmp_path,
+        {"2026-08-18.md": older, "2026-08-19.md": newest},
+    )
+
+    assert "OLD_DAY_MARKER" not in context
+    assert context == ""
+
+
+def test_claude_session_start_recent_memory_trims_utf8_on_line_boundaries(tmp_path: Path) -> None:
+    journal = "\n".join(
+        [
+            "# 2026-08-19",
+            "",
+            "## Session 17:00",
+            "### 17:00",
+            *[f"- 用户讨论了新的检索策略 需要保留完整中文内容 {index}" for index in range(50)],
+            "- 最新记录: 需要优先保存",
+            "",
+        ]
+    )
+
+    context = _run_claude_session_start_with_memory(tmp_path, {"2026-08-19.md": journal})
+
+    assert "最新记录" in context
+    assert len(context.encode("utf-8")) <= 1800
+
+
 def test_claude_session_start_uv_tool_upgrade_hint_preserves_extras(tmp_path: Path) -> None:
     script = Path("plugins/claude-code/hooks/session-start.sh")
     home = tmp_path / "home"
@@ -210,6 +517,9 @@ def test_claude_session_start_uv_tool_upgrade_hint_preserves_extras(tmp_path: Pa
     uv_tool_bin.mkdir(parents=True)
     (home / ".memsearch").mkdir()
     (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+    # The PyPI lookup itself runs off the blocking path, so prime its cache:
+    # this test is about which upgrade command the hint names.
+    (home / ".memsearch" / ".pypi-latest").write_text("0.4.13", encoding="utf-8")
 
     fake_memsearch = uv_tool_bin / "memsearch"
     fake_memsearch.write_text(
@@ -288,7 +598,7 @@ def test_claude_session_start_reads_resolved_config_once(tmp_path: Path) -> None
         """#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
 if [ "$1" = "config" ] && [ "$2" = "list" ]; then
-  echo '{"embedding":{"provider":"voyage","model":"voyage-3-lite","api_key":"configured-key"},"milvus":{"uri":"http://localhost:19530"}}'
+  echo '{"embedding":{"provider":"voyage","model":"voyage-3-lite","api_key":"configured-key"},"milvus":{"uri":"http://localhost:19530","collection":"project_collection"}}'
   exit 0
 fi
 if [ "$1" = "--version" ]; then
@@ -327,9 +637,13 @@ exit 0
     status = json.loads(result.stdout)["systemMessage"]
     calls = call_log.read_text(encoding="utf-8").splitlines()
     assert "embedding: voyage/voyage-3-lite" in status
+    assert "collection: project_collection" in status
     assert "ERROR: VOYAGE_API_KEY not set" not in status
-    assert calls.count("config list --resolved --json-output") == 1
-    assert not any(call.startswith("config get ") for call in calls)
+    assert sum(call.startswith("config list --resolved --json-output --default-collection ") for call in calls) == 1
+    assert calls.count(next(call for call in calls if call.startswith("config get milvus.collection"))) == 1
+    assert not any(
+        call.startswith("config get ") and not call.startswith("config get milvus.collection") for call in calls
+    )
     assert not any(call.startswith("skills status ") for call in calls)
 
 
@@ -398,7 +712,7 @@ exit 0
     calls = call_log.read_text(encoding="utf-8").splitlines()
     assert "embedding: voyage/voyage-3-lite" in status
     assert "ERROR: VOYAGE_API_KEY not set" not in status
-    assert calls.count("config list --resolved --json-output") == 1
+    assert sum(call.startswith("config list --resolved --json-output --default-collection ") for call in calls) == 1
     assert "config get embedding.provider" in calls
     assert "config get embedding.model" in calls
     assert "config get milvus.uri" in calls
@@ -506,6 +820,105 @@ exit 0
         assert "memory-config skill" in status
 
 
+@pytest.mark.skipif(os.name != "posix", reason="the controlled one-shot index uses a FIFO")
+@pytest.mark.parametrize("final_status", ["ok", "error"])
+def test_claude_session_start_lite_one_shot_persists_visible_state(tmp_path: Path, final_status: str) -> None:
+    script = Path("plugins/claude-code/hooks/session-start.sh")
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    memsearch_dir = tmp_path / ".memsearch"
+    state = memsearch_dir / ".index-state.json"
+    started = tmp_path / "index-started"
+    release = tmp_path / "index-release"
+    uri_file = tmp_path / "milvus-uri"
+    home.mkdir()
+    fake_bin.mkdir()
+    memsearch_dir.mkdir()
+    (home / ".memsearch").mkdir()
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+    (home / ".memsearch" / ".pypi-latest").write_text("0.4.14", encoding="utf-8")
+    uri_file.write_text(str(tmp_path / "lite.db"), encoding="utf-8")
+    os.mkfifo(release)
+
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+uri=$(cat "$TEST_URI_FILE")
+write_state() {
+  printf '%s\n' "$1" > "$TEST_STATE_FILE.$$"
+  mv "$TEST_STATE_FILE.$$" "$TEST_STATE_FILE"
+}
+if [ "$1" = config ] && [ "$2" = list ]; then
+  printf '{"embedding":{"provider":"onnx","model":"test-model","api_key":""},"milvus":{"uri":"%s"}}\n' "$uri"
+  exit 0
+fi
+if [ "$1" = config ] && [ "$2" = get ]; then
+  case "$3" in
+    embedding.provider) echo onnx ;;
+    embedding.model) echo test-model ;;
+    milvus.uri) echo "$uri" ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = --version ]; then
+  echo 'memsearch, version 0.4.14'
+  exit 0
+fi
+if [ "$1" = index ]; then
+  write_state '{"schema_version":1,"status":"running"}'
+  : > "$TEST_STARTED_FILE"
+  IFS= read -r _ < "$TEST_RELEASE_FIFO"
+  if [ "$TEST_FINAL_STATUS" = ok ]; then
+    write_state '{"schema_version":1,"status":"ok","indexed_chunks":1}'
+    exit 0
+  fi
+  write_state '{"schema_version":1,"status":"error","last_error":"controlled failure"}'
+  exit 23
+fi
+exit 0
+""",
+    )
+    _write_executable(fake_bin / "pgrep", "#!/usr/bin/env bash\nexit 1\n")
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(memsearch_dir),
+        "TEST_URI_FILE": str(uri_file),
+        "TEST_STATE_FILE": str(state),
+        "TEST_STARTED_FILE": str(started),
+        "TEST_RELEASE_FIFO": str(release),
+        "TEST_FINAL_STATUS": final_status,
+    }
+
+    first = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env, check=True)
+    assert str(tmp_path / "lite.db") in json.loads(first.stdout)["systemMessage"]
+    assert _wait_for(started.exists)
+    release.write_text("complete\n", encoding="utf-8")
+    assert _wait_for(lambda: state.exists() and json.loads(state.read_text())["status"] == final_status)
+    persisted = json.loads(state.read_text(encoding="utf-8"))
+    assert persisted["status"] == final_status
+    if final_status == "ok":
+        assert persisted["indexed_chunks"] == 1
+    else:
+        assert persisted["last_error"] == "controlled failure"
+
+    # A fresh Lite SessionStart surfaces the previous result before launching its
+    # own one-shot index. Keep process cleanup disabled for this controlled child;
+    # the Lite indexing branch still runs and is released below.
+    started.unlink()
+    inspect_env = {**env, "MEMSEARCH_NO_WATCH": "1"}
+    second = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=inspect_env, check=True)
+    status = json.loads(second.stdout)["systemMessage"]
+    assert str(tmp_path / "lite.db") in status
+    assert ("WARNING: memory index may be stale" in status) is (final_status == "error")
+    assert _wait_for(started.exists)
+    release.write_text("complete\n", encoding="utf-8")
+    assert _wait_for(lambda: state.exists() and json.loads(state.read_text())["status"] == final_status)
+
+
 def test_session_start_shows_skill_candidate_hint(tmp_path: Path) -> None:
     hint = "SKILLS: 2 candidate skill version(s) pending install - run the memory-to-skill skill to review and install."
     for name, script in (
@@ -578,14 +991,42 @@ exit 0
         assert hint in status
 
 
-def test_claude_stop_hook_writes_summary_without_safe_mode_flag(tmp_path: Path) -> None:
-    script = Path("plugins/claude-code/hooks/stop.sh")
-    plugin_root = Path("plugins/claude-code").resolve()
+@pytest.mark.parametrize(
+    ("root_state", "prompt_kind"),
+    [
+        ("valid", "bundled"),
+        ("unset", "bundled"),
+        ("empty", "bundled"),
+        ("wrong", "bundled"),
+        ("unset", "custom"),
+        ("unset", "missing-custom"),
+        ("unset", "inline"),
+    ],
+)
+def test_claude_stop_hook_writes_summary_without_safe_mode_flag(
+    tmp_path: Path, root_state: str, prompt_kind: str
+) -> None:
+    plugin_root = tmp_path / "plugin with spaces"
+    shutil.copytree("plugins/claude-code", plugin_root)
+    script = plugin_root / "hooks" / "stop.sh"
+    bundled_prompt = plugin_root / "prompts" / "summarize.txt"
+    expected_prompt = bundled_prompt.read_text(encoding="utf-8").replace("{{AGENT_NAME}}", "Claude Code").rstrip()
+    custom_prompt = ""
+    if prompt_kind == "custom":
+        custom_prompt = "custom prompt.txt"
+        (tmp_path / custom_prompt).write_text("Custom notes for {{AGENT_NAME}}.", encoding="utf-8")
+        expected_prompt = "Custom notes for Claude Code."
+    elif prompt_kind == "missing-custom":
+        custom_prompt = "missing prompt.txt"
+    elif prompt_kind == "inline":
+        bundled_prompt.unlink()
+        expected_prompt = "You are a third-person note-taker."
     home = tmp_path / "home"
     fake_bin = tmp_path / "bin"
     memsearch_dir = tmp_path / ".memsearch"
     transcript = tmp_path / "session-123.jsonl"
     claude_args = tmp_path / "claude-args.txt"
+    claude_input = tmp_path / "claude-input.txt"
     home.mkdir()
     fake_bin.mkdir()
     transcript.write_text(
@@ -614,7 +1055,7 @@ if [ "$1" = "config" ] && [ "$2" = "get" ]; then
     plugins.claude-code.summarize.enabled) echo "true" ;;
     plugins.claude-code.summarize.model) echo "" ;;
     plugins.claude-code.summarize.provider) echo "" ;;
-    prompts.summarize) echo "" ;;
+    prompts.summarize) echo "$TEST_CUSTOM_PROMPT" ;;
     *) echo "" ;;
   esac
   exit 0
@@ -636,6 +1077,7 @@ if [ "${1:-}" = "--help" ]; then
   exit 0
 fi
 printf '%s\n' "$@" > "$CLAUDE_ARGS_FILE"
+cat > "$CLAUDE_INPUT_FILE"
 echo "- User discussed a macOS stop hook regression."
 """,
         encoding="utf-8",
@@ -650,7 +1092,15 @@ echo "- User discussed a macOS stop hook regression."
         "CLAUDE_PROJECT_DIR": str(tmp_path),
         "MEMSEARCH_DIR": str(memsearch_dir),
         "CLAUDE_ARGS_FILE": str(claude_args),
+        "CLAUDE_INPUT_FILE": str(claude_input),
+        "TEST_CUSTOM_PROMPT": custom_prompt,
     }
+    if root_state == "unset":
+        env.pop("CLAUDE_PLUGIN_ROOT", None)
+    elif root_state == "empty":
+        env["CLAUDE_PLUGIN_ROOT"] = ""
+    elif root_state == "wrong":
+        env["CLAUDE_PLUGIN_ROOT"] = str(tmp_path / "unrelated plugin")
     result = subprocess.run(
         ["bash", str(script)],
         input=json.dumps({"transcript_path": str(transcript)}),
@@ -665,11 +1115,329 @@ echo "- User discussed a macOS stop hook regression."
     assert len(memory_files) == 1
     memory_text = memory_files[0].read_text(encoding="utf-8")
     assert "macOS stop hook regression" in memory_text
+    assert "session:session-123 turn:turn-1" in memory_text
+    assert "Summarize this session" not in memory_text
+    assert claude_input.read_text(encoding="utf-8").startswith(expected_prompt)
 
     captured_args = claude_args.read_text(encoding="utf-8").splitlines()
     assert captured_args[:4] == ["-p", "--strict-mcp-config", "--tools", ""]
     assert "--safe-mode" not in captured_args
     assert captured_args[captured_args.index("--model") + 1] == "haiku"
+
+
+@pytest.mark.parametrize(
+    ("milvus_uri", "expected_index_calls", "expected_pgrep_calls"),
+    [
+        ("/tmp/memsearch-lite.db", 0, 0),
+        ("http://127.0.0.1:19530", 1, 1),
+        ("tcp://127.0.0.1:19530", 1, 1),
+        ("unix:/run/user/1000/memsearch/milvus.sock", 1, 1),
+    ],
+    ids=["lite", "http-server", "tcp-server", "unix-socket-server"],
+)
+def test_claude_stop_indexes_only_server(
+    tmp_path: Path,
+    milvus_uri: str,
+    expected_index_calls: int,
+    expected_pgrep_calls: int,
+) -> None:
+    script = Path("plugins/claude-code/hooks/stop.sh")
+    transcript = tmp_path / "session.jsonl"
+    fake_bin = tmp_path / "bin"
+    call_log = tmp_path / "calls.log"
+    pgrep_log = tmp_path / "pgrep.log"
+    (tmp_path / "home").mkdir()
+    fake_bin.mkdir()
+    _write_claude_transcript(transcript, turn_uuid="turn-index-backend")
+
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
+if [ "$1" = config ] && [ "$2" = get ]; then
+  case "$3" in
+    embedding.provider) echo onnx ;;
+    milvus.uri) echo "$TEST_MILVUS_URI" ;;
+    plugins.claude-code.summarize.enabled) echo true ;;
+    plugins.claude-code.summarize.provider) echo native ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = index ]; then
+  exit 0
+fi
+""",
+    )
+    _write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = --help ]; then
+  exit 0
+fi
+cat >/dev/null
+echo '- Captured a backend-specific summary.'
+""",
+    )
+    _write_executable(
+        fake_bin / "pgrep",
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PGREP_CALL_LOG"
+exit 1
+""",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path / "home"),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PLUGIN_ROOT": str(Path("plugins/claude-code").resolve()),
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(tmp_path / ".memsearch"),
+        "MEMSEARCH_CALL_LOG": str(call_log),
+        "PGREP_CALL_LOG": str(pgrep_log),
+        "TEST_MILVUS_URI": milvus_uri,
+    }
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        input=json.dumps({"transcript_path": str(transcript)}),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    pgrep_calls = pgrep_log.read_text(encoding="utf-8").splitlines() if pgrep_log.exists() else []
+    assert result.stdout.strip() == "{}"
+    assert len([call for call in calls if call.startswith("index ")]) == expected_index_calls
+    assert len(pgrep_calls) == expected_pgrep_calls
+
+
+def test_claude_stop_hook_sends_large_native_prompt_on_stdin(tmp_path: Path) -> None:
+    script = Path("plugins/claude-code/hooks/stop.sh")
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    memsearch_dir = tmp_path / ".memsearch"
+    transcript = tmp_path / "large.jsonl"
+    received = tmp_path / "received.txt"
+    home.mkdir()
+    fake_bin.mkdir()
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "system", "message": {"content": "start"}}),
+                json.dumps({"type": "user", "uuid": "turn-large", "message": {"content": "x" * 200000}}),
+                json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  case "$3" in
+    embedding.provider) echo onnx ;;
+    plugins.claude-code.summarize.enabled) echo true ;;
+    plugins.claude-code.summarize.provider) echo "" ;;
+    plugins.claude-code.summarize.model) echo "" ;;
+    prompts.summarize) echo "" ;;
+  esac
+fi
+if [ "$1" = index ]; then exit 0; fi
+""",
+    )
+    _write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = --help ]; then exit 0; fi
+cat > "$CLAUDE_INPUT_FILE"
+echo '- Large turn summarized.'
+""",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PLUGIN_ROOT": str(Path("plugins/claude-code").resolve()),
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(memsearch_dir),
+        "CLAUDE_INPUT_FILE": str(received),
+    }
+    result = subprocess.run(
+        ["bash", str(script)],
+        input=json.dumps({"transcript_path": str(transcript)}),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    assert result.stdout.strip() == "{}"
+    assert len(received.read_text(encoding="utf-8")) > 200000
+    memory_text = next((memsearch_dir / "memory").glob("*.md")).read_text(encoding="utf-8")
+    assert "Large turn summarized." in memory_text
+    assert "x" * 1000 not in memory_text
+
+
+@pytest.mark.parametrize("route", ["native", "provider"])
+@pytest.mark.parametrize("mode", ["missing", "nonzero", "empty", "timeout"])
+def test_claude_stop_hook_failure_never_persists_transcript(tmp_path: Path, route: str, mode: str) -> None:
+    script = Path("plugins/claude-code/hooks/stop.sh")
+    home, fake_bin, memsearch_dir = tmp_path / "home", tmp_path / "bin", tmp_path / ".memsearch"
+    transcript = tmp_path / "session.jsonl"
+    home.mkdir()
+    fake_bin.mkdir()
+    marker = "SECRET-TRANSCRIPT-MARKER"
+    _write_claude_transcript(transcript, turn_uuid="turn-failure")
+    transcript.write_text(
+        transcript.read_text(encoding="utf-8").replace("Summarize this session", marker), encoding="utf-8"
+    )
+    provider = "openai" if route == "provider" else ""
+    provider_mode = mode if route == "provider" else "success"
+    _write_executable(
+        fake_bin / "memsearch",
+        f"""#!/usr/bin/env bash
+if [ "$1" = config ] && [ "$2" = get ]; then
+  case "$3" in
+    embedding.provider) echo onnx ;;
+    plugins.claude-code.summarize.enabled) echo true ;;
+    plugins.claude-code.summarize.provider) echo "{provider}" ;;
+    *) echo "" ;;
+  esac
+fi
+if [ "$1" = index ]; then exit 0; fi
+if [ "$1" = summarize ]; then
+  case "{provider_mode}" in
+    missing) exit 127 ;;
+    nonzero) exit 23 ;;
+    empty) exit 0 ;;
+    timeout) echo should-not-run ;;
+  esac
+fi
+""",
+    )
+    if route == "native" and mode != "missing":
+        body = '#!/usr/bin/env bash\nif [ "${1:-}" = --help ]; then exit 0; fi\n'
+        body += {"nonzero": "exit 23\n", "empty": "exit 0\n", "timeout": "echo should-not-run\n"}[mode]
+        _write_executable(fake_bin / "claude", body)
+    if mode == "timeout":
+        _write_executable(
+            fake_bin / "timeout",
+            '#!/usr/bin/env bash\nif [ "$1" = 110 ]; then exit 124; fi\nshift\nexec "$@"\n',
+        )
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PLUGIN_ROOT": str(Path("plugins/claude-code").resolve()),
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(memsearch_dir),
+    }
+    subprocess.run(
+        ["bash", str(script)],
+        input=json.dumps({"transcript_path": str(transcript)}),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+        timeout=125,
+    )
+    memory_text = next((memsearch_dir / "memory").glob("*.md")).read_text(encoding="utf-8")
+    assert marker not in memory_text
+    assert "transcript content was omitted" in memory_text
+    assert "session:session turn:turn-failure" in memory_text
+
+
+@pytest.mark.parametrize("provider", ["", "native"], ids=["default", "explicit-native"])
+@pytest.mark.parametrize(
+    ("summary", "is_error"),
+    [
+        ("You've hit your limit · resets 11am (Africa/Johannesburg)", True),
+        ("API Error: 429 Too Many Requests", True),
+        ('API Error: 401 {"error":{"type":"authentication_error"}}', True),
+        ("- No significant changes.", False),
+        ("User investigated rate limits and authentication.", False),
+        ("- Added retries for rate limit exceeded responses and HTTP 401, 403, and 429 errors.", False),
+        ('- Documented the "You\'ve hit your limit" and "API Error: 429" notices.', False),
+        ("- User debugged retries.\nAPI Error: 429 was the response recorded in the transcript.", False),
+    ],
+    ids=[
+        "plan-limit",
+        "api-rate-limit",
+        "api-auth",
+        "short",
+        "plain-text",
+        "error-terms",
+        "quoted-errors",
+        "error-line",
+    ],
+)
+def test_claude_stop_hook_validates_native_summary_output(
+    tmp_path: Path, provider: str, summary: str, is_error: bool
+) -> None:
+    script = Path("plugins/claude-code/hooks/stop.sh")
+    home, fake_bin, memsearch_dir = tmp_path / "home", tmp_path / "bin", tmp_path / ".memsearch"
+    transcript = tmp_path / "session.jsonl"
+    home.mkdir()
+    fake_bin.mkdir()
+    _write_claude_transcript(transcript, turn_uuid="turn-output")
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+if [ "$1" = config ] && [ "$2" = get ]; then
+  case "$3" in
+    embedding.provider) echo onnx ;;
+    plugins.claude-code.summarize.enabled) echo true ;;
+    plugins.claude-code.summarize.provider) echo "$TEST_SUMMARIZE_PROVIDER" ;;
+    *) echo "" ;;
+  esac
+fi
+exit 0
+""",
+    )
+    _write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = --help ]; then exit 0; fi
+cat >/dev/null
+printf '%s\n' "$TEST_SUMMARY"
+exit 0
+""",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PLUGIN_ROOT": str(Path("plugins/claude-code").resolve()),
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(memsearch_dir),
+        "TEST_SUMMARIZE_PROVIDER": provider,
+        "TEST_SUMMARY": summary,
+    }
+    result = subprocess.run(
+        ["bash", str(script)],
+        input=json.dumps({"transcript_path": str(transcript)}),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    memory_text = next((memsearch_dir / "memory").glob("*.md")).read_text(encoding="utf-8")
+    assert json.loads(result.stdout) == {}
+    assert "## Session " in memory_text
+    assert "### " in memory_text
+    assert f"<!-- session:session turn:turn-output transcript:{transcript} -->" in memory_text
+    if is_error:
+        assert summary not in memory_text
+        assert "Memory summary unavailable: summarizer returned an error response" in memory_text
+        assert "transcript content was omitted" in memory_text
+        assert "Summarize this session" not in memory_text
+        assert "I explained the hook behavior." not in memory_text
+    else:
+        assert summary in memory_text
+        assert "Memory summary unavailable" not in memory_text
 
 
 def test_claude_stop_hook_groups_session_headings(tmp_path: Path) -> None:
@@ -775,3 +1543,1106 @@ def test_claude_stop_hook_avoids_empty_array_expansion_under_nounset() -> None:
 
     assert '"${CLAUDE_SAFE_MODE_ARGS[@]}"' not in source
     assert "CLAUDE_SAFE_MODE_ARG" in source
+
+
+def _wait_for(predicate, timeout: float = 15.0) -> bool:
+    """Poll until the detached refresh child has landed (or give up)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _install_layout(root: Path, version: str) -> Path:
+    """Create a uv/pipx-style install tree and return its bin directory."""
+    bin_dir = root / "bin"
+    site = root / "lib" / "python3.14" / "site-packages"
+    bin_dir.mkdir(parents=True)
+    site.mkdir(parents=True)
+    (site / f"memsearch-{version}.dist-info").mkdir()
+    return bin_dir
+
+
+def _session_start_env(tmp_path: Path, home: Path, fake_bin: Path, call_log: Path) -> dict[str, str]:
+    return {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_DIR": str(tmp_path / ".memsearch"),
+        "MEMSEARCH_NO_WATCH": "1",
+        "MEMSEARCH_CALL_LOG": str(call_log),
+    }
+
+
+def test_codex_session_start_reports_resolved_collection(tmp_path: Path) -> None:
+    script = Path("plugins/codex/hooks/session-start.sh")
+    home = tmp_path / "home"
+    (home / ".memsearch").mkdir(parents=True)
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+    (tmp_path / ".memsearch").mkdir()
+    call_log = tmp_path / "memsearch-calls.txt"
+
+    fake_bin = _install_layout(tmp_path / "opt", "9.9.9")
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  case "$3" in
+    embedding.provider) echo "onnx" ;;
+    embedding.model) echo "tiny" ;;
+    milvus.uri) echo "/tmp/x.db" ;;
+    milvus.collection) echo "project_collection" ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+exit 0
+""",
+    )
+    _write_executable(fake_bin / "curl", """#!/usr/bin/env bash\necho '{"info":{"version":"9.9.9"}}'\n""")
+    env = _session_start_env(tmp_path, home, fake_bin, call_log)
+    env["MEMSEARCH_PROJECT_DIR"] = str(tmp_path)
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        input=json.dumps({"cwd": str(tmp_path)}),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+    status = json.loads(result.stdout)["systemMessage"]
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert "collection: project_collection" in status
+    collection_call = next(call for call in calls if call.startswith("config get milvus.collection"))
+    assert "--default-collection " in collection_call
+
+
+def test_claude_session_start_reads_version_from_dist_info(tmp_path: Path) -> None:
+    """The status version comes from dist-info, without a second CLI start."""
+    script = Path("plugins/claude-code/hooks/session-start.sh")
+    home = tmp_path / "home"
+    (home / ".memsearch").mkdir(parents=True)
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+    (tmp_path / ".memsearch").mkdir()
+    call_log = tmp_path / "memsearch-calls.txt"
+
+    fake_bin = _install_layout(tmp_path / "opt", "9.9.9")
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"onnx","model":"tiny"},"milvus":{"uri":"/tmp/x.db"}}'
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "memsearch, version 0.0.0-should-not-be-used"
+  exit 0
+fi
+exit 0
+""",
+    )
+    _write_executable(fake_bin / "curl", """#!/usr/bin/env bash\necho '{"info":{"version":"9.9.9"}}'\n""")
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env=_session_start_env(tmp_path, home, fake_bin, call_log),
+        check=True,
+    )
+
+    status = json.loads(result.stdout)["systemMessage"]
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert "[memsearch v9.9.9]" in status
+    assert "--version" not in calls
+
+
+def test_claude_session_start_falls_back_to_cli_version_without_dist_info(tmp_path: Path) -> None:
+    """Layouts with no discoverable dist-info still report a version."""
+    script = Path("plugins/claude-code/hooks/session-start.sh")
+    home = tmp_path / "home"
+    (home / ".memsearch").mkdir(parents=True)
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+    (tmp_path / ".memsearch").mkdir()
+    call_log = tmp_path / "memsearch-calls.txt"
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"onnx","model":"tiny"},"milvus":{"uri":"/tmp/x.db"}}'
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "memsearch, version 1.2.3"
+  exit 0
+fi
+exit 0
+""",
+    )
+    _write_executable(fake_bin / "curl", """#!/usr/bin/env bash\necho '{"info":{"version":"1.2.3"}}'\n""")
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env=_session_start_env(tmp_path, home, fake_bin, call_log),
+        check=True,
+    )
+
+    status = json.loads(result.stdout)["systemMessage"]
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert "[memsearch v1.2.3]" in status
+    assert "--version" in calls
+
+
+def _write_bsd_readlink_shim(shim_dir: Path) -> None:
+    """Shadow readlink with a macOS-like implementation that rejects -f."""
+    real_readlink = shutil.which("readlink")
+    assert real_readlink is not None
+    _write_executable(
+        shim_dir / "readlink",
+        f"""#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ "$arg" = "-f" ]; then
+    echo "readlink: illegal option -- f" >&2
+    exit 1
+  fi
+done
+exec "{real_readlink}" "$@"
+""",
+    )
+
+
+@pytest.mark.parametrize(
+    "common_sh",
+    ["plugins/claude-code/hooks/common.sh", "plugins/codex/hooks/common.sh"],
+    ids=["claude-code", "codex"],
+)
+def test_dist_info_version_resolves_symlinked_bin_without_gnu_readlink(tmp_path: Path, common_sh: str) -> None:
+    """A symlinked entry point (uv tool / pipx layout) must resolve to its
+    install tree even where readlink lacks -f (BSD readlink on macOS)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    install_bin = _install_layout(tmp_path / "opt", "9.9.9")
+    _write_executable(install_bin / "memsearch", "#!/usr/bin/env bash\nexit 0\n")
+
+    # ~/.local/bin/memsearch -> ../opt/bin/memsearch, a relative target like
+    # the ones uv writes.
+    link_bin = tmp_path / "links"
+    link_bin.mkdir()
+    (link_bin / "memsearch").symlink_to(Path("..") / "opt" / "bin" / "memsearch")
+
+    shim_bin = tmp_path / "shims"
+    shim_bin.mkdir()
+    _write_bsd_readlink_shim(shim_bin)
+
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1" < /dev/null && _installed_version_from_dist_info', "bash", common_sh],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{shim_bin}:{link_bin}:{os.environ['PATH']}",
+            "MEMSEARCH_DISABLE": "",
+        },
+        check=True,
+    )
+
+    assert result.stdout == "9.9.9"
+
+
+def test_claude_session_start_resolves_symlinked_bin_without_gnu_readlink(tmp_path: Path) -> None:
+    """The full SessionStart path works through a symlinked uv tool install
+    without GNU readlink: version comes from dist-info (no --version call) and
+    the update hint recognizes the uv/tools layout behind the symlink."""
+    script = Path("plugins/claude-code/hooks/session-start.sh")
+    home = tmp_path / "home"
+    (home / ".memsearch").mkdir(parents=True)
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+    # The PyPI lookup itself runs off the blocking path, so prime its cache:
+    # this test is about which upgrade command the hint names.
+    (home / ".memsearch" / ".pypi-latest").write_text("9.9.10", encoding="utf-8")
+    (tmp_path / ".memsearch").mkdir()
+    call_log = tmp_path / "memsearch-calls.txt"
+
+    install_bin = _install_layout(tmp_path / "share" / "uv" / "tools" / "memsearch", "9.9.9")
+    _write_executable(
+        install_bin / "memsearch",
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"onnx","model":"tiny"},"milvus":{"uri":"/tmp/x.db"}}'
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "memsearch, version 0.0.0-should-not-be-used"
+  exit 0
+fi
+exit 0
+""",
+    )
+
+    link_bin = tmp_path / "local-bin"
+    link_bin.mkdir()
+    (link_bin / "memsearch").symlink_to(Path("..") / "share" / "uv" / "tools" / "memsearch" / "bin" / "memsearch")
+
+    fake_bin = tmp_path / "shims"
+    fake_bin.mkdir()
+    _write_bsd_readlink_shim(fake_bin)
+    _write_executable(fake_bin / "curl", """#!/usr/bin/env bash\necho '{"info":{"version":"9.9.10"}}'\n""")
+
+    env = _session_start_env(tmp_path, home, fake_bin, call_log)
+    env["PATH"] = f"{link_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+    status = json.loads(result.stdout)["systemMessage"]
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert "[memsearch v9.9.9]" in status
+    assert "--version" not in calls
+    assert "uv tool upgrade memsearch" in status
+
+
+# Both plugins ship a byte-identical copy of the hook helpers, so every PyPI
+# test below runs against both session starts: a fix that lands in one copy and
+# not the other fails here instead of drifting silently.
+SESSION_STARTS = ["plugins/claude-code/hooks/session-start.sh", "plugins/codex/hooks/session-start.sh"]
+COMMON_SHS = ["plugins/claude-code/hooks/common.sh", "plugins/codex/hooks/common.sh"]
+PLUGIN_IDS = ["claude-code", "codex"]
+
+
+@pytest.mark.parametrize("common_sh", COMMON_SHS, ids=PLUGIN_IDS)
+def test_plugin_commands_pass_derived_collection_as_default(tmp_path: Path, common_sh: str) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    call_log = tmp_path / "calls.txt"
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
+""",
+    )
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path / "home"),
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_PROJECT_DIR": str(tmp_path),
+        "MEMSEARCH_CALL_LOG": str(call_log),
+        "MEMSEARCH_NO_WATCH": "1",
+    }
+    common = Path(common_sh).resolve()
+
+    subprocess.run(
+        ["bash", "-c", f'source "{common}"; run_memsearch search "test query"'],
+        input="{}",
+        text=True,
+        cwd=tmp_path,
+        env=env,
+        check=True,
+    )
+
+    call = call_log.read_text(encoding="utf-8").strip()
+    assert "--default-collection " in call
+    assert " --collection " not in f" {call} "
+
+
+def _write_project_aware_memsearch(fake_bin: Path) -> None:
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+printf '%s|%s\n' "$PWD" "$*" >> "$MEMSEARCH_CALL_LOG"
+if [ "$PWD" = "$MEMSEARCH_TEST_PROJECT" ]; then
+  resolved_collection="project_collection"
+elif [ "$PWD" = "$MEMSEARCH_TEST_UNRELATED" ]; then
+  resolved_collection="unrelated_collection"
+else
+  resolved_collection="global_collection"
+fi
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  printf '{"embedding":{"provider":"onnx","model":"tiny"},"milvus":{"uri":"http://127.0.0.1:19530","collection":"%s"}}\n' "$resolved_collection"
+  exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  case "$3" in
+    embedding.provider) echo "onnx" ;;
+    embedding.model) echo "tiny" ;;
+    milvus.uri) echo "http://127.0.0.1:19530" ;;
+    milvus.collection) echo "$resolved_collection" ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "memsearch, version 9.9.9"
+fi
+exit 0
+""",
+    )
+    _write_executable(fake_bin / "curl", '#!/usr/bin/env bash\necho \'{"info":{"version":"9.9.9"}}\'\n')
+
+
+@pytest.mark.parametrize(
+    "milvus_uri",
+    ["http://127.0.0.1:19530", "tcp://127.0.0.1:19530", "unix:/run/user/1000/memsearch/milvus.sock"],
+    ids=["http", "tcp", "unix-socket"],
+)
+@pytest.mark.parametrize(
+    ("script", "project_var"),
+    [
+        ("plugins/claude-code/hooks/session-start.sh", "CLAUDE_PROJECT_DIR"),
+        ("plugins/codex/hooks/session-start.sh", "MEMSEARCH_PROJECT_DIR"),
+    ],
+    ids=PLUGIN_IDS,
+)
+def test_session_start_watches_server_uris(tmp_path: Path, script: str, project_var: str, milvus_uri: str) -> None:
+    project = tmp_path / "project"
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    for directory in (project / ".memsearch", home / ".memsearch", fake_bin):
+        directory.mkdir(parents=True, exist_ok=True)
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+    call_log = tmp_path / "calls.log"
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  printf '{"embedding":{"provider":"onnx","model":"tiny"},"milvus":{"uri":"%s"}}\n' "$TEST_MILVUS_URI"
+  exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  case "$3" in
+    embedding.provider) echo "onnx" ;;
+    embedding.model) echo "tiny" ;;
+    milvus.uri) echo "$TEST_MILVUS_URI" ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "memsearch, version 9.9.9"
+fi
+exit 0
+""",
+    )
+    _write_executable(fake_bin / "curl", '#!/usr/bin/env bash\necho \'{"info":{"version":"9.9.9"}}\'\n')
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        project_var: str(project),
+        "MEMSEARCH_CALL_LOG": str(call_log),
+        "TEST_MILVUS_URI": milvus_uri,
+    }
+
+    subprocess.run(
+        ["bash", str(Path(script).resolve())],
+        input=json.dumps({"cwd": str(project)}),
+        capture_output=True,
+        text=True,
+        cwd=project,
+        env=env,
+        check=True,
+    )
+
+    assert _wait_for(
+        lambda: call_log.exists() and any(call.startswith("watch ") for call in call_log.read_text().splitlines()),
+        timeout=5.0,
+    )
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("index ") for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("platform", "script", "project_var"),
+    [
+        ("claude-code", "plugins/claude-code/hooks/session-start.sh", "CLAUDE_PROJECT_DIR"),
+        ("codex", "plugins/codex/hooks/session-start.sh", "MEMSEARCH_PROJECT_DIR"),
+    ],
+)
+@pytest.mark.parametrize("outside_kind", ["plain-directory", "unrelated-git-repository"])
+def test_session_start_and_data_commands_are_scoped_to_host_project(
+    tmp_path: Path, platform: str, script: str, project_var: str, outside_kind: str
+) -> None:
+    project = tmp_path / "target-project"
+    outside = tmp_path / "outside"
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    for directory in (project / ".memsearch", outside, home / ".memsearch", fake_bin):
+        directory.mkdir(parents=True, exist_ok=True)
+    if outside_kind == "unrelated-git-repository":
+        subprocess.run(["git", "init", "-q", str(outside)], check=True)
+
+    (home / ".memsearch" / "config.toml").write_text('[milvus]\ncollection = "global_collection"\n', encoding="utf-8")
+    (project / ".memsearch.toml").write_text('[milvus]\ncollection = "project_collection"\n', encoding="utf-8")
+    (outside / ".memsearch.toml").write_text('[milvus]\ncollection = "unrelated_collection"\n', encoding="utf-8")
+    call_log = tmp_path / f"{platform}-{outside_kind}.log"
+    _write_project_aware_memsearch(fake_bin)
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        project_var: str(project),
+        "MEMSEARCH_CALL_LOG": str(call_log),
+        "MEMSEARCH_TEST_PROJECT": str(project),
+        "MEMSEARCH_TEST_UNRELATED": str(outside),
+    }
+    result = subprocess.run(
+        ["bash", str(Path(script).resolve())],
+        input=json.dumps({"cwd": str(project)}),
+        capture_output=True,
+        text=True,
+        cwd=outside,
+        env=env,
+        check=True,
+    )
+    status = json.loads(result.stdout)["systemMessage"]
+    assert "collection: project_collection" in status
+
+    common = Path(script).with_name("common.sh").resolve()
+    data = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{common}"; before=$PWD; run_memsearch search query --collection explicit_collection; printf "%s" "$before|$PWD"',
+        ],
+        input=json.dumps({"cwd": str(project)}),
+        capture_output=True,
+        text=True,
+        cwd=outside,
+        env=env,
+        check=True,
+    )
+    assert data.stdout == f"{outside}|{outside}"
+
+    assert _wait_for(
+        lambda: call_log.exists() and "|watch " in call_log.read_text(encoding="utf-8"),
+        timeout=5.0,
+    )
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert calls
+    assert all(call.startswith(f"{project}|") for call in calls)
+    assert any("|config " in call for call in calls)
+    assert any("|search query --collection explicit_collection " in call for call in calls)
+    assert any(" --default-collection " in call for call in calls if "|search " in call)
+    assert any("|watch " in call for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("script", "project_var"),
+    [
+        ("plugins/claude-code/hooks/session-start.sh", "CLAUDE_PROJECT_DIR"),
+        ("plugins/codex/hooks/session-start.sh", "MEMSEARCH_PROJECT_DIR"),
+    ],
+    ids=PLUGIN_IDS,
+)
+def test_old_core_is_rejected_before_collection_actions(tmp_path: Path, script: str, project_var: str) -> None:
+    project = tmp_path / "project"
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    for directory in (project / ".memsearch", home / ".memsearch", fake_bin):
+        directory.mkdir(parents=True, exist_ok=True)
+    (home / ".memsearch" / "config.toml").write_text('[milvus]\ncollection = "global_collection"\n', encoding="utf-8")
+    call_log = tmp_path / "old-core-calls.log"
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MEMSEARCH_CALL_LOG"
+case " $* " in
+  *" --default-collection "*)
+    echo "Error: No such option: --default-collection" >&2
+    exit 2
+    ;;
+esac
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"onnx","model":"tiny"},"milvus":{"uri":"http://127.0.0.1:19530","collection":"global_collection"}}'
+  exit 0
+fi
+if [ "$1" = "config" ] && [ "$2" = "get" ]; then
+  case "$3" in
+    embedding.provider) echo onnx ;;
+    embedding.model) echo tiny ;;
+    milvus.uri) echo http://127.0.0.1:19530 ;;
+    milvus.collection) echo global_collection ;;
+  esac
+  exit 0
+fi
+exit 0
+""",
+    )
+    _write_executable(fake_bin / "curl", '#!/usr/bin/env bash\necho \'{"info":{"version":"0.4.19"}}\'\n')
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        project_var: str(project),
+        "MEMSEARCH_CALL_LOG": str(call_log),
+    }
+    result = subprocess.run(
+        ["bash", str(Path(script).resolve())],
+        input=json.dumps({"cwd": str(project)}),
+        capture_output=True,
+        text=True,
+        cwd=project,
+        env=env,
+        check=True,
+    )
+    assert "ERROR: installed memsearch CLI is incompatible" in json.loads(result.stdout)["systemMessage"]
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith(("index ", "watch ", "search ", "expand ")) for call in calls)
+
+    common = Path(script).with_name("common.sh").resolve()
+    data = subprocess.run(
+        ["bash", "-c", f'source "{common}"; run_memsearch search query'],
+        input=json.dumps({"cwd": str(project)}),
+        capture_output=True,
+        text=True,
+        cwd=project,
+        env=env,
+    )
+    assert data.returncode == 2
+    assert "--default-collection support is required" in data.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("search ") for call in calls)
+
+
+def _pypi_stand(tmp_path: Path, curl_body: str, installed: str = "1.0.0"):
+    """Session-start stand whose PyPI lookup is a fake curl of our choosing."""
+    home = tmp_path / "home"
+    (home / ".memsearch").mkdir(parents=True)
+    (home / ".memsearch" / "config.toml").write_text("", encoding="utf-8")
+    (tmp_path / ".memsearch").mkdir()
+    call_log = tmp_path / "memsearch-calls.txt"
+    curl_log = tmp_path / "curl-calls.txt"
+
+    fake_bin = _install_layout(tmp_path / "opt", installed)
+    _write_executable(
+        fake_bin / "memsearch",
+        """#!/usr/bin/env bash
+printf '%s
+' "$*" >> "$MEMSEARCH_CALL_LOG"
+if [ "$1" = "config" ] && [ "$2" = "list" ]; then
+  echo '{"embedding":{"provider":"onnx","model":"tiny"},"milvus":{"uri":"/tmp/x.db"}}'
+  exit 0
+fi
+exit 0
+""",
+    )
+    _write_executable(fake_bin / "curl", curl_body)
+    env = _session_start_env(tmp_path, home, fake_bin, call_log)
+    env["CURL_CALL_LOG"] = str(curl_log)
+    # The codex hook reads its project dir from its own variable.
+    env["MEMSEARCH_PROJECT_DIR"] = str(tmp_path)
+    return home, env, curl_log
+
+
+@pytest.mark.parametrize("script", SESSION_STARTS, ids=PLUGIN_IDS)
+def test_session_start_caches_pypi_lookup(tmp_path: Path, script: str) -> None:
+    """PyPI is queried on the first start and served from cache on the next."""
+    home, env, curl_log = _pypi_stand(
+        tmp_path,
+        """#!/usr/bin/env bash\nprintf 'called\\n' >> "$CURL_CALL_LOG"\necho '{"info":{"version":"2.0.0"}}'\n""",
+    )
+
+    cache = home / ".memsearch" / ".pypi-latest"
+    first = subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True)
+    assert _wait_for(lambda: cache.exists() and cache.read_text(encoding="utf-8") == "2.0.0")
+    second = subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True)
+
+    assert curl_log.read_text(encoding="utf-8").count("called") == 1
+    assert cache.read_text(encoding="utf-8") == "2.0.0"
+    # The first start has no answer to show yet: the lookup it triggered runs off
+    # the blocking path, so the hint arrives from the next start onwards.
+    assert "UPDATE:" not in json.loads(first.stdout)["systemMessage"]
+    assert "UPDATE: v2.0.0 available" in json.loads(second.stdout)["systemMessage"]
+
+
+@pytest.mark.parametrize("script", SESSION_STARTS, ids=PLUGIN_IDS)
+def test_session_start_caches_failed_pypi_lookup(tmp_path: Path, script: str) -> None:
+    """A failed lookup is cached too, so an offline machine stops retrying."""
+    # Stand in for an unreachable index: no output, non-zero exit.
+    home, env, curl_log = _pypi_stand(
+        tmp_path,
+        """#!/usr/bin/env bash\nprintf 'called\\n' >> "$CURL_CALL_LOG"\nexit 6\n""",
+    )
+
+    cache = home / ".memsearch" / ".pypi-latest"
+    first = subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True)
+    # The failure is recorded by the detached child, so wait for it to land: only
+    # a recorded answer -- including this empty one -- marks the cache fresh.
+    assert _wait_for(lambda: cache.exists())
+    second = subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True)
+
+    assert _wait_for(lambda: curl_log.exists() and curl_log.read_text(encoding="utf-8").count("called") == 1)
+    assert curl_log.read_text(encoding="utf-8").count("called") == 1
+    assert cache.exists() and cache.read_text(encoding="utf-8") == ""
+    # No latest version known, so no hint is claimed either way.
+    for run in (first, second):
+        assert "UPDATE:" not in json.loads(run.stdout)["systemMessage"]
+
+
+@pytest.mark.parametrize("script", SESSION_STARTS, ids=PLUGIN_IDS)
+def test_session_start_does_not_wait_for_the_pypi_lookup(tmp_path: Path, script: str) -> None:
+    """A slow lookup costs the session start nothing, and never fakes a fresh cache.
+
+    The lookup is held open by a file this test creates only after the session
+    start has returned, so the pin is the ordering itself rather than a
+    wall-clock bound that a loaded runner could miss.
+    """
+    release = tmp_path / "release-curl"
+    home, env, curl_log = _pypi_stand(
+        tmp_path,
+        """#!/usr/bin/env bash
+printf 'called\n' >> "$CURL_CALL_LOG"
+i=0
+while [ ! -f "$CURL_RELEASE" ] && [ "$i" -lt 600 ]; do
+  sleep 0.05
+  i=$((i + 1))
+done
+echo '{"info":{"version":"2.0.0"}}'
+""",
+    )
+    env["CURL_RELEASE"] = str(release)
+
+    # A start that waited on the child cannot return while the lookup is held,
+    # so the timeout is the failure mode, not the assertion.
+    subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True, timeout=60)
+
+    # The lookup is still in flight here. Nothing may present the cache as fresh
+    # before an answer lands: a start that claimed freshness up front would
+    # suppress the hint for a day whenever its refresh failed to finish.
+    cache = home / ".memsearch" / ".pypi-latest"
+    assert not cache.exists(), "cache was marked fresh before the lookup answered"
+    assert _wait_for(lambda: curl_log.exists() and curl_log.read_text(encoding="utf-8").count("called") == 1)
+
+    release.write_text("go", encoding="utf-8")
+    assert _wait_for(lambda: cache.exists() and cache.read_text(encoding="utf-8") == "2.0.0", timeout=20.0)
+    assert curl_log.read_text(encoding="utf-8").count("called") == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="hook process lifecycle is POSIX-only")
+@pytest.mark.parametrize("script", SESSION_STARTS, ids=PLUGIN_IDS)
+def test_session_start_refresh_survives_abrupt_hook_exit(tmp_path: Path, script: str) -> None:
+    """The refresh child survives when the hook process itself is killed."""
+    curl_release = tmp_path / "release-curl"
+    curl_started = tmp_path / "curl-started"
+    curl_pid_file = tmp_path / "curl.pid"
+    blocker_release = tmp_path / "release-blocker"
+    blocker_started = tmp_path / "blocker-started"
+    blocker_pid_file = tmp_path / "blocker.pid"
+    home, env, _ = _pypi_stand(
+        tmp_path,
+        """#!/usr/bin/env bash
+printf '%s' "$$" > "$CURL_PID_FILE"
+: > "$CURL_STARTED"
+i=0
+while [ ! -f "$CURL_RELEASE" ] && [ "$i" -lt 600 ]; do
+  sleep 0.05
+  i=$((i + 1))
+done
+echo '{"info":{"version":"2.0.0"}}'
+""",
+    )
+    env.update(
+        {
+            "CURL_PID_FILE": str(curl_pid_file),
+            "CURL_STARTED": str(curl_started),
+            "CURL_RELEASE": str(curl_release),
+            "BLOCKER_PID_FILE": str(blocker_pid_file),
+            "BLOCKER_STARTED": str(blocker_started),
+            "BLOCKER_RELEASE": str(blocker_release),
+            "REAL_PYTHON": sys.executable,
+        }
+    )
+    state = tmp_path / ".memsearch" / ".index-state.json"
+    state.write_text('{"status":"error"}', encoding="utf-8")
+    fake_bin = Path(env["PATH"].split(os.pathsep)[0])
+    _write_executable(
+        fake_bin / "python3",
+        """#!/usr/bin/env bash
+# Only block the index-state read, not interpreter detection or JSON helpers.
+if [ "${1:-}" != "-" ]; then
+  exec "$REAL_PYTHON" "$@"
+fi
+printf '%s' "$$" > "$BLOCKER_PID_FILE"
+: > "$BLOCKER_STARTED"
+i=0
+while [ ! -f "$BLOCKER_RELEASE" ] && [ "$i" -lt 600 ]; do
+  sleep 0.05
+  i=$((i + 1))
+done
+""",
+    )
+
+    hook = subprocess.Popen(
+        ["bash", script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
+    )
+    child_pids: list[int] = []
+    try:
+        assert _wait_for(lambda: curl_started.exists() and blocker_started.exists())
+        child_pids = [int(curl_pid_file.read_text()), int(blocker_pid_file.read_text())]
+
+        hook.kill()
+        hook.wait(timeout=10)
+        assert hook.returncode == -signal.SIGKILL
+        os.kill(child_pids[0], 0)
+
+        curl_release.write_text("go", encoding="utf-8")
+        cache = home / ".memsearch" / ".pypi-latest"
+        assert _wait_for(lambda: cache.exists() and cache.read_text(encoding="utf-8") == "2.0.0")
+    finally:
+        curl_release.touch()
+        blocker_release.touch()
+        if hook.poll() is None:
+            hook.kill()
+            hook.wait(timeout=10)
+        for pid in child_pids:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGTERM)
+
+
+@pytest.mark.parametrize("script", SESSION_STARTS, ids=PLUGIN_IDS)
+def test_session_start_shows_the_stale_hint_while_refreshing(tmp_path: Path, script: str) -> None:
+    """An expired cache is still worth showing; the refresh happens behind it."""
+    home, env, curl_log = _pypi_stand(
+        tmp_path,
+        """#!/usr/bin/env bash\nprintf 'called\\n' >> "$CURL_CALL_LOG"\necho '{"info":{"version":"3.0.0"}}'\n""",
+    )
+    cache = home / ".memsearch" / ".pypi-latest"
+    cache.write_text("2.0.0", encoding="utf-8")
+    two_days_ago = time.time() - 2 * 24 * 3600
+    os.utime(cache, (two_days_ago, two_days_ago))
+
+    run = subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True)
+
+    assert "UPDATE: v2.0.0 available" in json.loads(run.stdout)["systemMessage"]
+    assert _wait_for(lambda: cache.read_text(encoding="utf-8") == "3.0.0")
+    assert curl_log.read_text(encoding="utf-8").count("called") == 1
+
+
+@pytest.mark.parametrize("script", SESSION_STARTS, ids=PLUGIN_IDS)
+def test_session_start_refreshes_an_expired_empty_cache(tmp_path: Path, script: str) -> None:
+    """An expired failed-lookup marker is retried without emitting a hint."""
+    home, env, curl_log = _pypi_stand(
+        tmp_path,
+        """#!/usr/bin/env bash\nprintf 'called\\n' >> "$CURL_CALL_LOG"\necho '{"info":{"version":"2.0.0"}}'\n""",
+    )
+    cache = home / ".memsearch" / ".pypi-latest"
+    cache.write_text("", encoding="utf-8")
+    two_days_ago = time.time() - 2 * 24 * 3600
+    os.utime(cache, (two_days_ago, two_days_ago))
+
+    run = subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True)
+
+    assert "UPDATE:" not in json.loads(run.stdout)["systemMessage"]
+    assert _wait_for(lambda: cache.read_text(encoding="utf-8") == "2.0.0")
+    assert curl_log.read_text(encoding="utf-8").count("called") == 1
+
+
+@pytest.mark.parametrize("script", SESSION_STARTS, ids=PLUGIN_IDS)
+def test_session_start_serves_stale_then_caches_a_failed_refresh(tmp_path: Path, script: str) -> None:
+    """A stale answer is served once; a completed failed refresh is fresh-empty."""
+    home, env, curl_log = _pypi_stand(
+        tmp_path,
+        """#!/usr/bin/env bash\nprintf 'called\\n' >> "$CURL_CALL_LOG"\nexit 6\n""",
+    )
+    cache = home / ".memsearch" / ".pypi-latest"
+    cache.write_text("2.0.0", encoding="utf-8")
+    two_days_ago = time.time() - 2 * 24 * 3600
+    os.utime(cache, (two_days_ago, two_days_ago))
+
+    first = subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True)
+    assert "UPDATE: v2.0.0 available" in json.loads(first.stdout)["systemMessage"]
+    assert _wait_for(lambda: cache.read_text(encoding="utf-8") == "")
+
+    second = subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True)
+    assert "UPDATE:" not in json.loads(second.stdout)["systemMessage"]
+    assert curl_log.read_text(encoding="utf-8").count("called") == 1
+
+
+@pytest.mark.parametrize("script", SESSION_STARTS, ids=PLUGIN_IDS)
+def test_session_start_concurrent_refreshes_publish_atomically(tmp_path: Path, script: str) -> None:
+    """Concurrent starts may refresh, but each owns a temp file until atomic publish.
+
+    A durable single-flight lock would need stale-owner recovery if the detached
+    child dies. The bounded duplicate request is safer here; distinct temp files
+    and same-directory renames keep readers from observing partial contents.
+    """
+    home, env, curl_log = _pypi_stand(
+        tmp_path,
+        """#!/usr/bin/env bash\nprintf 'called\\n' >> "$CURL_CALL_LOG"\necho '{"info":{"version":"3.0.0"}}'\n""",
+    )
+    cache = home / ".memsearch" / ".pypi-latest"
+    cache.write_text("2.0.0", encoding="utf-8")
+    two_days_ago = time.time() - 2 * 24 * 3600
+    os.utime(cache, (two_days_ago, two_days_ago))
+
+    move_log = tmp_path / "move-calls.txt"
+    move_release = tmp_path / "release-move"
+    fake_bin = Path(env["PATH"].split(os.pathsep)[0])
+    _write_executable(
+        fake_bin / "mv",
+        """#!/usr/bin/env bash
+printf '%s\t%s\n' "$2" "$3" >> "$MOVE_CALL_LOG"
+i=0
+while [ ! -f "$MOVE_RELEASE" ] && [ "$i" -lt 600 ]; do
+  sleep 0.05
+  i=$((i + 1))
+done
+exec /bin/mv "$@"
+""",
+    )
+    env["MOVE_CALL_LOG"] = str(move_log)
+    env["MOVE_RELEASE"] = str(move_release)
+
+    runs = [
+        subprocess.Popen(["bash", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        for _ in range(3)
+    ]
+    outputs = [run.communicate(timeout=60) for run in runs]
+
+    assert all(run.returncode == 0 for run in runs), outputs
+    assert _wait_for(lambda: move_log.exists() and len(move_log.read_text().splitlines()) == 3)
+    moves = [line.split("\t") for line in move_log.read_text(encoding="utf-8").splitlines()]
+    sources = [Path(source) for source, _ in moves]
+    destinations = [Path(destination) for _, destination in moves]
+    assert len(set(sources)) == 3
+    assert destinations == [cache, cache, cache]
+    assert all(source.parent == cache.parent for source in sources)
+    assert all(source.read_text(encoding="utf-8") == "3.0.0" for source in sources)
+    assert cache.read_text(encoding="utf-8") == "2.0.0"
+    assert curl_log.read_text(encoding="utf-8").count("called") == 3
+
+    move_release.write_text("go", encoding="utf-8")
+    assert _wait_for(lambda: cache.read_text(encoding="utf-8") == "3.0.0")
+    assert _wait_for(lambda: all(not source.exists() for source in sources))
+
+
+@pytest.mark.parametrize("script", SESSION_STARTS, ids=PLUGIN_IDS)
+def test_session_start_removes_temp_file_when_publish_fails(tmp_path: Path, script: str) -> None:
+    """A failed atomic publish preserves stale data and removes its temp file."""
+    home, env, _ = _pypi_stand(
+        tmp_path,
+        """#!/usr/bin/env bash\necho '{"info":{"version":"3.0.0"}}'\n""",
+    )
+    cache = home / ".memsearch" / ".pypi-latest"
+    cache.write_text("2.0.0", encoding="utf-8")
+    two_days_ago = time.time() - 2 * 24 * 3600
+    os.utime(cache, (two_days_ago, two_days_ago))
+
+    move_log = tmp_path / "move-calls.txt"
+    fake_bin = Path(env["PATH"].split(os.pathsep)[0])
+    _write_executable(
+        fake_bin / "mv",
+        """#!/usr/bin/env bash
+printf '%s\t%s\n' "$2" "$3" >> "$MOVE_CALL_LOG"
+exit 1
+""",
+    )
+    env["MOVE_CALL_LOG"] = str(move_log)
+
+    subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True)
+
+    assert _wait_for(lambda: move_log.exists())
+    source, destination = move_log.read_text(encoding="utf-8").strip().split("\t")
+    assert Path(destination) == cache
+    assert cache.read_text(encoding="utf-8") == "2.0.0"
+    assert _wait_for(lambda: not Path(source).exists())
+
+
+@pytest.mark.parametrize("script", SESSION_STARTS, ids=PLUGIN_IDS)
+def test_session_start_does_not_hint_a_downgrade_from_the_cache(tmp_path: Path, script: str) -> None:
+    """A cached answer older than the installed build is not an update.
+
+    Serving a stale cache widened the window in which the cached version can
+    trail the installed one -- upgrade between two writes and the old value is
+    still on disk. Compared as strings it merely differs, and the hint would
+    tell the user to "upgrade" to the version they just left.
+    """
+    home, env, _ = _pypi_stand(
+        tmp_path,
+        """#!/usr/bin/env bash\nprintf 'called\\n' >> "$CURL_CALL_LOG"\necho '{"info":{"version":"1.0.0"}}'\n""",
+        installed="1.0.0",
+    )
+    cache = home / ".memsearch" / ".pypi-latest"
+    cache.write_text("0.9.13", encoding="utf-8")
+    two_days_ago = time.time() - 2 * 24 * 3600
+    os.utime(cache, (two_days_ago, two_days_ago))
+
+    run = subprocess.run(["bash", script], capture_output=True, text=True, env=env, check=True)
+
+    status = json.loads(run.stdout)["systemMessage"]
+    assert "UPDATE:" not in status, status
+    # The refresh still runs behind the suppressed hint.
+    assert _wait_for(lambda: cache.read_text(encoding="utf-8") == "1.0.0")
+
+
+@pytest.mark.parametrize("common_sh", COMMON_SHS, ids=PLUGIN_IDS)
+def test_version_gt_orders_supported_versions(common_sh: str) -> None:
+    """Order the supported PEP 440 subset and reject unknown shapes safely."""
+    cases = [
+        ("0.4.14", "0.4.13", True),
+        ("0.4.13", "0.4.14", False),
+        ("0.4.13", "0.4.13", False),
+        # The pair that produced the downgrade hint: 9 < 13 as numbers, but
+        # "0.4.9" > "0.4.13" as strings.
+        ("0.4.9", "0.4.13", False),
+        ("0.4.13", "0.4.9", True),
+        ("1.0.0", "0.9.9", True),
+        ("10.0.0", "9.0.0", True),
+        ("0.5", "0.4.13", True),
+        ("0.4.13", "0.5", False),
+        # A zero-padded field must not be read as octal.
+        ("0.4.08", "0.4.7", True),
+        # Development and pre-release builds sort before their final release.
+        ("1.2.0", "1.2.0.dev1", True),
+        ("1.2.0.dev2", "1.2.0.dev1", True),
+        ("1.2.0a1", "1.2.0.dev9", True),
+        ("1.2.0b1", "1.2.0a2", True),
+        ("1.2.0rc2", "1.2.0rc1", True),
+        ("1.2.0", "1.2.0rc1", True),
+        ("1.2.0rc1", "1.2.0", False),
+        # Post releases sort after the final release.
+        ("1.2.0.post1", "1.2.0", True),
+        ("1.2.0.post2", "1.2.0.post1", True),
+        ("1.2.0", "1.2.0.post1", False),
+        # Local labels describe the installed build, not a newer public release.
+        ("1.2.0", "1.2.0+local.1", False),
+        ("1.2.1", "1.2.0+local.1", True),
+        # Unknown shapes cannot be ordered safely, so neither side may hint.
+        ("2.0.0", "unknown", False),
+        ("unknown", "1.0.0", False),
+        ("2.0.0foo", "1.0.0", False),
+    ]
+    script = 'source "$1" < /dev/null; shift; while [ "$#" -gt 0 ]; do if _version_gt "$1" "$2"; then echo gt; else echo not; fi; shift 2; done'
+    args = []
+    for left, right, _ in cases:
+        args += [left, right]
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", common_sh, *args],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "MEMSEARCH_DISABLE": ""},
+        check=True,
+    )
+
+    got = result.stdout.split()
+    want = ["gt" if expected else "not" for _, _, expected in cases]
+    assert got == want, [(c, g, w) for c, g, w in zip(cases, got, want, strict=True) if g != w]
+
+
+@pytest.mark.parametrize("common_sh", COMMON_SHS, ids=PLUGIN_IDS)
+@pytest.mark.parametrize("milvus_uri", ["local", "http://127.0.0.1:19530", "tcp://127.0.0.1:19530"])
+@pytest.mark.parametrize("mode", ["pidfile", "missing-pidfile", "child-guard"])
+def test_index_cleanup_preserves_active_lite_services(
+    tmp_path: Path, common_sh: str, milvus_uri: str, mode: str
+) -> None:
+    """Stop previous index tasks without terminating other database owners' services."""
+    home = tmp_path / "home"
+    memsearch_dir = tmp_path / ".memsearch"
+    fake_bin = tmp_path / "bin"
+    for folder in (home, memsearch_dir, fake_bin):
+        folder.mkdir()
+    own_db = tmp_path / "index.db"
+    other_db = tmp_path / "other app" / "index.db"
+    fake_milvus = fake_bin / "milvus_lite" / "lib" / "milvus"
+    fake_milvus.parent.mkdir(parents=True)
+    # These stand-ins model process ownership, not database behavior. Restore TERM
+    # in case the test runner ignores it, and use a readiness line before cleanup.
+    sleeper = (
+        f"#!{sys.executable}\n"
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    _write_executable(fake_milvus, sleeper)
+    _write_executable(fake_bin / "index-task", sleeper)
+    processes = []
+
+    def spawn(argv: list[str]) -> subprocess.Popen:
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+        processes.append(process)
+        assert process.stdout.readline().strip() == "ready"
+        return process
+
+    try:
+        index = spawn([str(fake_bin / "index-task")])
+        own = spawn([str(fake_milvus), str(own_db), "unix:test.sock", "ERROR"])
+        other = spawn([str(fake_milvus), str(other_db), "unix:other.sock", "ERROR"])
+        pidfile = memsearch_dir / ".index.pid"
+        if mode != "missing-pidfile":
+            pidfile.write_text(str(index.pid), encoding="utf-8")
+        _write_executable(
+            fake_bin / "memsearch",
+            '#!/usr/bin/env bash\nif [ "$*" = "config get milvus.uri" ]; then echo "$TEST_MILVUS_URI"; fi\n',
+        )
+        # Limit process discovery to this test's PIDs, including when testing the
+        # old sweep. Never allow the hook to discover unrelated real processes.
+        _write_executable(
+            fake_bin / "pgrep",
+            """#!/usr/bin/env bash
+case "$*" in
+  *milvus_lite/lib/milvus*) printf '%s\n' "$TEST_OWN_PID" "$TEST_OTHER_PID" ;;
+  *'memsearch index '*) printf '%s\n' "$TEST_INDEX_PID" ;;
+  *) exit 1 ;;
+esac
+""",
+        )
+        env = {
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "CLAUDE_PROJECT_DIR": str(tmp_path),
+            "MEMSEARCH_PROJECT_DIR": str(tmp_path),
+            "MEMSEARCH_DIR": str(memsearch_dir),
+            "TEST_MILVUS_URI": str(own_db) if milvus_uri == "local" else milvus_uri,
+            "TEST_INDEX_PID": str(index.pid),
+            "TEST_OWN_PID": str(own.pid),
+            "TEST_OTHER_PID": str(other.pid),
+        }
+        if mode == "child-guard":
+            env["MEMSEARCH_NO_WATCH"] = "1"
+        subprocess.run(
+            ["bash", "-c", 'source "$1" < /dev/null; kill_orphaned_index', "bash", str(Path(common_sh).resolve())],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        if mode == "child-guard":
+            assert index.poll() is None
+            assert pidfile.exists()
+        else:
+            assert index.wait(timeout=5) == -signal.SIGTERM
+            assert not pidfile.exists()
+        # Waiting briefly also observes asynchronously delivered SIGTERM.
+        time.sleep(0.1)
+        assert own.poll() is None, "cleanup interrupted an active holder of the configured database"
+        assert other.poll() is None, "cleanup interrupted another application's database"
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            process.stdout.close()

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 import click
 
+from .chunker import _HEADING_RE
 from .config import (
     GLOBAL_CONFIG_PATH,
     PROJECT_CONFIG_PATH,
@@ -29,6 +31,7 @@ from .index_state import (
     resolve_index_state_path,
 )
 from .io import read_utf8_text_replace
+from .store import CollectionNotFoundError
 
 try:
     from pymilvus.exceptions import MilvusException
@@ -41,9 +44,15 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _safe_resolve_config(overrides: dict | None = None):
+def _safe_resolve_config(
+    overrides: dict | None = None,
+    *,
+    default_overrides: dict | None = None,
+):
     """Resolve config with user-friendly error for missing env vars."""
     try:
+        if default_overrides:
+            return resolve_config(overrides, default_overrides=default_overrides)
         return resolve_config(overrides)
     except ConfigEnvVarError as e:
         click.echo(f"Configuration error: {e}", err=True)
@@ -168,6 +177,21 @@ def _load_plugin_summarize_prompt(cfg: MemSearchConfig, agent_name: str) -> str:
 # -- Common CLI options --
 
 
+def _configure_cli_streams() -> None:
+    """Configure CLI output streams for reliable Unicode output."""
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(AttributeError, OSError):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+class _MemSearchGroup(click.Group):
+    """Configure CLI streams before Click parses arguments or exits eagerly."""
+
+    def main(self, *args, **kwargs):
+        _configure_cli_streams()
+        return super().main(*args, **kwargs)
+
+
 def _common_options(f):
     """Shared options for commands that create a MemSearch instance."""
     f = click.option("--provider", "-p", default=None, help="Embedding provider.")(f)
@@ -176,6 +200,11 @@ def _common_options(f):
     f = click.option("--base-url", default=None, help="OpenAI-compatible API base URL.")(f)
     f = click.option("--api-key", default=None, help="API key for the embedding provider.")(f)
     f = click.option("--collection", "-c", default=None, help="Milvus collection name.")(f)
+    f = click.option(
+        "--default-collection",
+        default=None,
+        help="Fallback collection name; explicit config and --collection take precedence.",
+    )(f)
     f = click.option("--milvus-uri", default=None, help="Milvus connection URI.")(f)
     f = click.option("--milvus-token", default=None, help="Milvus auth token.")(f)
     return f
@@ -200,7 +229,7 @@ def _indexing_options(f):
     return f
 
 
-@click.group()
+@click.group(cls=_MemSearchGroup)
 @click.version_option(package_name="memsearch")
 def cli() -> None:
     """memsearch — semantic memory search for markdown knowledge bases."""
@@ -214,7 +243,11 @@ def cli() -> None:
 @click.option(
     "--max-chunk-size", default=None, type=click.IntRange(min=1), help="Max chunk size in characters (must be >= 1)."
 )
-@click.option("--description", default=None, help="Collection description (written on creation only).")
+@click.option(
+    "--description",
+    default=None,
+    help="Best-effort collection metadata written on creation; some backends may not return it.",
+)
 def index(
     paths: tuple[str, ...],
     provider: str | None,
@@ -223,6 +256,7 @@ def index(
     base_url: str | None,
     api_key: str | None,
     collection: str | None,
+    default_collection: str | None,
     milvus_uri: str | None,
     milvus_token: str | None,
     ignore_files: tuple[str, ...],
@@ -246,7 +280,8 @@ def index(
             milvus_uri=milvus_uri,
             milvus_token=milvus_token,
             max_chunk_size=max_chunk_size,
-        )
+        ),
+        default_overrides=_build_cli_overrides(collection=default_collection),
     )
     ms = None
     try:
@@ -324,6 +359,7 @@ def search(
     base_url: str | None,
     api_key: str | None,
     collection: str | None,
+    default_collection: str | None,
     milvus_uri: str | None,
     milvus_token: str | None,
     reranker_model: str | None,
@@ -343,7 +379,8 @@ def search(
             milvus_uri=milvus_uri,
             milvus_token=milvus_token,
             reranker_model=reranker_model,
-        )
+        ),
+        default_overrides=_build_cli_overrides(collection=default_collection),
     )
     ms = None
     try:
@@ -370,6 +407,9 @@ def search(
                     click.echo(f"  ... [truncated, run 'memsearch expand {chunk_hash}' for full content]")
                 else:
                     click.echo(content)
+    except CollectionNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1) from None
     except MilvusException as e:
         click.echo(f"Milvus error (code {e.code}): {e.message}", err=True)
         raise SystemExit(1) from None
@@ -393,7 +433,9 @@ def search(
 
 @cli.command()
 @click.argument("chunk_hash")
-@click.option("--section/--no-section", default=True, help="Show full heading section (default).")
+@click.option(
+    "--section/--no-section", default=True, help="Show full heading section (default) or only the chunk's own lines."
+)
 @click.option("--lines", "-n", default=None, type=int, help="Show N lines before/after instead of full section.")
 @click.option("--json-output", "-j", is_flag=True, help="Output as JSON.")
 @_common_options
@@ -408,13 +450,15 @@ def expand(
     base_url: str | None,
     api_key: str | None,
     collection: str | None,
+    default_collection: str | None,
     milvus_uri: str | None,
     milvus_token: str | None,
 ) -> None:
     """Expand a memory chunk to show full context. [Claude Code plugin: L2]
 
     Look up CHUNK_HASH in the index, then read the source markdown file
-    to return the surrounding context (full heading section by default).
+    to return the surrounding context (full heading section by default,
+    or the chunk's own lines with --no-section).
 
     Part of the progressive disclosure workflow (search -> expand -> transcript).
     """
@@ -430,7 +474,8 @@ def expand(
             collection=collection,
             milvus_uri=milvus_uri,
             milvus_token=milvus_token,
-        )
+        ),
+        default_overrides=_build_cli_overrides(collection=default_collection),
     )
     store = None
     try:
@@ -458,6 +503,17 @@ def expand(
             sys.exit(1)
 
         all_lines = read_utf8_text_replace(source_path).splitlines()
+        if start_line > len(all_lines):
+            click.echo(
+                f"Warning: chunk start_line {start_line} is past the end of {source} "
+                f"({len(all_lines)} lines); the index is out of sync with the file. "
+                "Re-run 'memsearch index <path>' to refresh it.",
+                err=True,
+            )
+
+        if lines is None and not section:
+            # Chunk-only view: same range as `--lines 0`
+            lines = 0
 
         if lines is not None:
             # Show N lines before/after the chunk
@@ -509,6 +565,9 @@ def expand(
                 click.echo(f"Session: {anchor['session']}  Turn: {anchor['turn']}")
                 click.echo(f"Transcript: {anchor['transcript']}")
             click.echo(f"\n{expanded}")
+    except CollectionNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1) from None
     except MilvusException as e:
         click.echo(f"Milvus error (code {e.code}): {e.message}", err=True)
         raise SystemExit(1) from None
@@ -527,27 +586,24 @@ def _extract_section(
     Walks backward to find the section heading, then forward to the next
     heading of equal or higher level (or EOF).
     """
-    # Find section start — walk backward to the heading
+    # Find section start — walk backward to the heading, starting at the
+    # chunk's own first line (clamped in case the file shrank since indexing)
     section_start = start_line - 1  # 0-indexed
     if heading_level > 0:
-        for i in range(start_line - 2, -1, -1):
-            line = all_lines[i]
-            if line.startswith("#"):
-                level = len(line) - len(line.lstrip("#"))
-                if level <= heading_level:
-                    section_start = i
-                    break
+        for i in range(min(start_line, len(all_lines)) - 1, -1, -1):
+            m = _HEADING_RE.match(all_lines[i])
+            if m and len(m.group(1)) <= heading_level:
+                section_start = i
+                break
 
     # Find section end — walk forward to the next heading of same or higher level
     section_end = len(all_lines)
     if heading_level > 0:
         for i in range(start_line, len(all_lines)):
-            line = all_lines[i]
-            if line.startswith("#"):
-                level = len(line) - len(line.lstrip("#"))
-                if level <= heading_level:
-                    section_end = i
-                    break
+            m = _HEADING_RE.match(all_lines[i])
+            if m and len(m.group(1)) <= heading_level:
+                section_end = i
+                break
 
     content = "\n".join(all_lines[section_start:section_end])
     return content, section_start + 1, section_end
@@ -561,7 +617,11 @@ def _extract_section(
 @click.option(
     "--max-chunk-size", default=None, type=click.IntRange(min=1), help="Max chunk size in characters (must be >= 1)."
 )
-@click.option("--description", default=None, help="Collection description (written on creation only).")
+@click.option(
+    "--description",
+    default=None,
+    help="Best-effort collection metadata written on creation; some backends may not return it.",
+)
 def watch(
     paths: tuple[str, ...],
     provider: str | None,
@@ -570,6 +630,7 @@ def watch(
     base_url: str | None,
     api_key: str | None,
     collection: str | None,
+    default_collection: str | None,
     milvus_uri: str | None,
     milvus_token: str | None,
     ignore_files: tuple[str, ...],
@@ -594,7 +655,8 @@ def watch(
             milvus_token=milvus_token,
             debounce_ms=debounce_ms,
             max_chunk_size=max_chunk_size,
-        )
+        ),
+        default_overrides=_build_cli_overrides(collection=default_collection),
     )
     ms = None
     watcher = None
@@ -707,6 +769,7 @@ def compact(
     base_url: str | None,
     api_key: str | None,
     collection: str | None,
+    default_collection: str | None,
     milvus_uri: str | None,
     milvus_token: str | None,
 ) -> None:
@@ -728,7 +791,8 @@ def compact(
             prompt_file=prompt_file,
             llm_base_url=llm_base_url,
             llm_api_key=llm_api_key,
-        )
+        ),
+        default_overrides=_build_cli_overrides(collection=default_collection),
     )
 
     prompt_template = prompt
@@ -767,6 +831,9 @@ def compact(
             click.echo(f"No chunks matched source: {normalized_source}")
         else:
             click.echo("No chunks to compact.")
+    except CollectionNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1) from None
     except MilvusException as e:
         click.echo(f"Milvus error (code {e.code}): {e.message}", err=True)
         raise SystemExit(1) from None
@@ -826,10 +893,16 @@ def summarize(plugin: str, agent_name: str) -> None:
 
 @cli.command()
 @click.option("--collection", "-c", default=None, help="Milvus collection name.")
+@click.option(
+    "--default-collection",
+    default=None,
+    help="Fallback collection name; explicit config and --collection take precedence.",
+)
 @click.option("--milvus-uri", default=None, help="Milvus connection URI.")
 @click.option("--milvus-token", default=None, help="Milvus auth token.")
 def stats(
     collection: str | None,
+    default_collection: str | None,
     milvus_uri: str | None,
     milvus_token: str | None,
 ) -> None:
@@ -841,7 +914,8 @@ def stats(
             collection=collection,
             milvus_uri=milvus_uri,
             milvus_token=milvus_token,
-        )
+        ),
+        default_overrides=_build_cli_overrides(collection=default_collection),
     )
     store = None
     try:
@@ -853,6 +927,9 @@ def stats(
         )
         count = store.count()
         click.echo(f"Total indexed chunks: {count}")
+    except CollectionNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1) from None
     except MilvusException as e:
         click.echo(f"Milvus error (code {e.code}): {e.message}", err=True)
         raise SystemExit(1) from None
@@ -863,11 +940,17 @@ def stats(
 
 @cli.command()
 @click.option("--collection", "-c", default=None, help="Milvus collection name.")
+@click.option(
+    "--default-collection",
+    default=None,
+    help="Fallback collection name; explicit config and --collection take precedence.",
+)
 @click.option("--milvus-uri", default=None, help="Milvus connection URI.")
 @click.option("--milvus-token", default=None, help="Milvus auth token.")
 @click.confirmation_option(prompt="This will delete all indexed data. Continue?")
 def reset(
     collection: str | None,
+    default_collection: str | None,
     milvus_uri: str | None,
     milvus_token: str | None,
 ) -> None:
@@ -879,7 +962,8 @@ def reset(
             collection=collection,
             milvus_uri=milvus_uri,
             milvus_token=milvus_token,
-        )
+        ),
+        default_overrides=_build_cli_overrides(collection=default_collection),
     )
     store = None
     try:
@@ -1196,10 +1280,21 @@ def config_set(key: str, value: str, project: bool) -> None:
 
 @config_group.command("get")
 @click.argument("key")
-def config_get(key: str) -> None:
+@click.option(
+    "--default-collection",
+    default=None,
+    help="Fallback collection name; explicit config takes precedence.",
+)
+def config_get(key: str, default_collection: str | None) -> None:
     """Get a resolved config value (e.g. memsearch config get milvus.uri)."""
     try:
-        val = get_config_value(key)
+        if default_collection is None:
+            val = get_config_value(key)
+        else:
+            cfg = resolve_config(
+                default_overrides=_build_cli_overrides(collection=default_collection),
+            )
+            val = get_config_value(key, cfg)
         # Lowercase booleans so shell consumers (e.g. hooks comparing against
         # "false") don't trip over Python's "True"/"False" repr.
         click.echo(str(val).lower() if isinstance(val, bool) else val)
@@ -1213,7 +1308,12 @@ def config_get(key: str) -> None:
 @click.option("--global", "mode", flag_value="global", help="Show global config file only.")
 @click.option("--project", "mode", flag_value="project", help="Show project config file only.")
 @click.option("--json-output", "-j", is_flag=True, help="Output as JSON.")
-def config_list(mode: str, json_output: bool) -> None:
+@click.option(
+    "--default-collection",
+    default=None,
+    help="Fallback collection for resolved output; explicit config takes precedence.",
+)
+def config_list(mode: str, json_output: bool, default_collection: str | None) -> None:
     """Show configuration."""
     if mode == "global":
         data = load_config_file(GLOBAL_CONFIG_PATH)
@@ -1222,7 +1322,12 @@ def config_list(mode: str, json_output: bool) -> None:
         data = load_config_file(PROJECT_CONFIG_PATH)
         label = f"Project ({PROJECT_CONFIG_PATH})"
     else:
-        cfg = resolve_config()
+        if default_collection is None:
+            cfg = resolve_config()
+        else:
+            cfg = resolve_config(
+                default_overrides=_build_cli_overrides(collection=default_collection),
+            )
         data = config_to_dict(cfg)
         label = "Resolved (all sources merged)"
 

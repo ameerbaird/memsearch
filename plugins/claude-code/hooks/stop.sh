@@ -11,6 +11,11 @@ if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
   exit 0
 fi
 
+if memsearch_available && ! require_default_collection_support; then
+  echo '{}'
+  exit 0
+fi
+
 # Skip summarization when the required API key is missing — embedding/search
 # would fail, and the session likely only contains the "key not set" warning.
 _required_env_var() {
@@ -23,13 +28,13 @@ _required_env_var() {
     *) echo "" ;;  # onnx, ollama, local — no API key needed
   esac
 }
-_PROVIDER=$($MEMSEARCH_CMD config get embedding.provider 2>/dev/null || echo "onnx")
+_PROVIDER=$(_memsearch config get embedding.provider 2>/dev/null || echo "onnx")
 _REQ_KEY=$(_required_env_var "$_PROVIDER")
 if [ -n "$_REQ_KEY" ] && [ -z "${!_REQ_KEY:-}" ]; then
   # Env var not set — check if API key is configured in memsearch config file
   _CONFIG_API_KEY=""
-  if [ -n "$MEMSEARCH_CMD" ]; then
-    _CONFIG_API_KEY=$($MEMSEARCH_CMD config get embedding.api_key 2>/dev/null || echo "")
+  if memsearch_available; then
+    _CONFIG_API_KEY=$(_memsearch config get embedding.api_key 2>/dev/null || echo "")
   fi
   if [ -z "$_CONFIG_API_KEY" ]; then
     echo '{}'
@@ -54,14 +59,15 @@ fi
 
 ensure_memory_dir
 
-SUMMARIZE_ENABLED=$($MEMSEARCH_CMD config get plugins.claude-code.summarize.enabled 2>/dev/null || echo "true")
+SUMMARIZE_ENABLED=$(_memsearch config get plugins.claude-code.summarize.enabled 2>/dev/null || echo "true")
 if [ "$SUMMARIZE_ENABLED" = "false" ]; then
   echo '{}'
   exit 0
 fi
 
-# Parse transcript — extract the last turn only (one user question + all responses)
-PARSED=$("$SCRIPT_DIR/parse-transcript.sh" "$TRANSCRIPT_PATH" 2>/dev/null || true)
+# Parse in a subshell to reuse the resolved Python command without changing
+# this hook's state. Extract the last turn only (one question + all responses).
+PARSED=$(source "$SCRIPT_DIR/parse-transcript.sh" "$TRANSCRIPT_PATH" 2>/dev/null || true)
 
 if [ -z "$PARSED" ] || [ "$PARSED" = "(empty transcript)" ] || [ "$PARSED" = "(no user message found)" ] || [ "$PARSED" = "(empty turn)" ]; then
   echo '{}'
@@ -75,7 +81,7 @@ MEMORY_FILE="$MEMORY_DIR/$TODAY.md"
 
 # Extract session ID and last user turn UUID for progressive disclosure anchors
 SESSION_ID=$(basename "$TRANSCRIPT_PATH" .jsonl)
-LAST_USER_TURN_UUID=$(python3 -c "
+LAST_USER_TURN_UUID=$(run_python -c "
 import json, sys
 uuid = ''
 with open(sys.argv[1], encoding='utf-8', errors='replace') as f:
@@ -111,13 +117,14 @@ fi
 # Load summarization prompt: user custom (via config) > plugin built-in template
 AGENT_NAME="Claude Code"
 PROMPT_FILE=""
-if [ -n "$MEMSEARCH_CMD" ]; then
-  PROMPT_FILE=$($MEMSEARCH_CMD config get prompts.summarize 2>/dev/null || true)
+if memsearch_available; then
+  PROMPT_FILE=$(_memsearch config get prompts.summarize 2>/dev/null || true)
+  [ -n "$PROMPT_FILE" ] && PROMPT_FILE=$(project_path "$PROMPT_FILE")
 fi
 if [ -n "$PROMPT_FILE" ] && [ -f "$PROMPT_FILE" ]; then
   SYSTEM_PROMPT=$(sed "s/{{AGENT_NAME}}/$AGENT_NAME/g" "$PROMPT_FILE")
-elif [ -f "${CLAUDE_PLUGIN_ROOT}/prompts/summarize.txt" ]; then
-  SYSTEM_PROMPT=$(sed "s/{{AGENT_NAME}}/$AGENT_NAME/g" "${CLAUDE_PLUGIN_ROOT}/prompts/summarize.txt")
+elif [ -f "$SCRIPT_DIR/../prompts/summarize.txt" ]; then
+  SYSTEM_PROMPT=$(sed "s/{{AGENT_NAME}}/$AGENT_NAME/g" "$SCRIPT_DIR/../prompts/summarize.txt")
 else
   SYSTEM_PROMPT="You are a third-person note-taker. Summarize the transcript as 2-10 bullet points. Write in third person. Mandatory language rule: write every bullet in the same primary language as the [User] text. If User mixes languages, use the dominant user-facing language. Do NOT answer User's question. Output ONLY bullet points."
 fi
@@ -127,26 +134,42 @@ fi
 # summarize model override can replace the model without changing provider
 # routing.
 SUMMARY=""
+SUMMARY_STATUS=0
+SUMMARY_FAILURE=""
 SUMMARIZE_PROVIDER=""
-if [ -n "$MEMSEARCH_CMD" ]; then
-  SUMMARIZE_PROVIDER=$($MEMSEARCH_CMD config get plugins.claude-code.summarize.provider 2>/dev/null || true)
+if memsearch_available; then
+  SUMMARIZE_PROVIDER=$(_memsearch config get plugins.claude-code.summarize.provider 2>/dev/null || true)
 fi
 
-if [ -n "$SUMMARIZE_PROVIDER" ] && [ "$SUMMARIZE_PROVIDER" != "native" ] && [ -n "$MEMSEARCH_CMD" ]; then
-  SUMMARY=$(printf '%s' "$PARSED" | MEMSEARCH_NO_WATCH=1 $MEMSEARCH_CMD summarize \
+_run_summarizer() {
+  (
+    cd "$_PROJECT_DIR"
+    if command -v timeout &>/dev/null; then
+      timeout 110 "$@"
+    else
+      perl -e 'alarm shift; exec @ARGV' 110 "$@"
+    fi
+  )
+}
+
+if [ -n "$SUMMARIZE_PROVIDER" ] && [ "$SUMMARIZE_PROVIDER" != "native" ] && memsearch_available; then
+  set +e
+  SUMMARY=$(printf '%s' "$PARSED" | MEMSEARCH_NO_WATCH=1 _run_summarizer "${MEMSEARCH_CMD[@]}" summarize \
     --plugin claude-code \
     --agent-name "$AGENT_NAME" \
-    2>/dev/null || true)
+    2>/dev/null)
+  SUMMARY_STATUS=$?
+  set -e
 elif command -v claude &>/dev/null; then
   SUMMARIZE_MODEL="haiku"
-  if [ -n "$MEMSEARCH_CMD" ]; then
-    CONFIG_MODEL=$($MEMSEARCH_CMD config get plugins.claude-code.summarize.model 2>/dev/null || true)
+  if memsearch_available; then
+    CONFIG_MODEL=$(_memsearch config get plugins.claude-code.summarize.model 2>/dev/null || true)
     if [ -n "$CONFIG_MODEL" ]; then
       SUMMARIZE_MODEL="$CONFIG_MODEL"
     fi
   fi
-  # Keep the shared external-observer prompt, but pass it as the primary prompt.
-  # This avoids the stdin + --system-prompt path while preserving summary rules.
+  # Keep the shared external-observer prompt as the primary prompt, but deliver
+  # it over stdin so transcript size never contributes to argv limits.
   LLM_PROMPT="${SYSTEM_PROMPT}
 
 Transcript:
@@ -155,20 +178,41 @@ ${PARSED}"
   if claude --help 2>/dev/null | grep -q -- '--safe-mode'; then
     CLAUDE_SAFE_MODE_ARG="--safe-mode"
   fi
-  SUMMARY=$(MEMSEARCH_NO_WATCH=1 MEMSEARCH_DISABLE=1 CLAUDECODE= claude -p \
+  set +e
+  SUMMARY=$(printf '%s' "$LLM_PROMPT" | MEMSEARCH_NO_WATCH=1 MEMSEARCH_DISABLE=1 CLAUDECODE= _run_summarizer claude -p \
     ${CLAUDE_SAFE_MODE_ARG:+"$CLAUDE_SAFE_MODE_ARG"} \
     --strict-mcp-config \
     --tools "" \
     --model "$SUMMARIZE_MODEL" \
     --no-session-persistence \
     --no-chrome \
-    "$LLM_PROMPT" \
-    2>/dev/null || true)
+    2>/dev/null)
+  SUMMARY_STATUS=$?
+  set -e
+  # Native CLI errors can arrive on stdout even with a successful exit status.
+  # Match response prefixes only, not error terms mentioned in valid summaries.
+  if [ "$SUMMARY_STATUS" -eq 0 ]; then
+    case "$SUMMARY" in
+      "You've hit your limit"*|"API Error:"*)
+        SUMMARY_FAILURE="summarizer returned an error response"
+        ;;
+    esac
+  fi
+else
+  SUMMARY_FAILURE="summarizer unavailable"
 fi
 
-# If claude is not available or returned empty, fall back to raw parsed output
-if [ -z "$SUMMARY" ]; then
-  SUMMARY="$PARSED"
+if [ -z "$SUMMARY_FAILURE" ] && [ "$SUMMARY_STATUS" -ne 0 ]; then
+  if [ "$SUMMARY_STATUS" -eq 124 ] || [ "$SUMMARY_STATUS" -eq 142 ]; then
+    SUMMARY_FAILURE="summarizer timed out"
+  else
+    SUMMARY_FAILURE="summarizer exited with status $SUMMARY_STATUS"
+  fi
+elif [ -z "$SUMMARY_FAILURE" ] && [ -z "$SUMMARY" ]; then
+  SUMMARY_FAILURE="summarizer returned empty output"
+fi
+if [ -n "$SUMMARY_FAILURE" ]; then
+  SUMMARY="- Memory summary unavailable: ${SUMMARY_FAILURE}; transcript content was omitted. Use the transcript anchor for progressive disclosure."
 fi
 
 # Append under a session heading, writing the heading lazily on the first
@@ -187,10 +231,13 @@ fi
   echo ""
 } >> "$MEMORY_FILE"
 
-# Kill any previous background index before re-indexing to avoid process accumulation
-kill_orphaned_index
-
-# Index immediately — don't rely on watch (which may be killed by SessionEnd before debounce fires)
-run_memsearch index "$MEMORY_DIR"
+# Server mode indexes immediately instead of relying on the watch debounce.
+# Lite mode keeps the SessionStart one-shot index: restarting it after every
+# turn can permanently starve a slow index before it completes.
+_uri="${MILVUS_URI:-$(_memsearch config get milvus.uri 2>/dev/null || echo "")}"
+if [[ "$_uri" == http* ]] || [[ "$_uri" == tcp* ]] || [[ "$_uri" == unix:* ]]; then
+  kill_orphaned_index
+  run_memsearch index "$MEMORY_DIR"
+fi
 
 echo '{}'

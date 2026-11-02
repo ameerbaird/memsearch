@@ -65,7 +65,7 @@ plugins/claude-code/
 ├── hooks/
 │   ├── common.sh                # Shared setup: PATH, memsearch detection, collection name, watch PID
 │   ├── session-start.sh         # SessionStart: start watch and inject recent memories
-│   ├── user-prompt-submit.sh    # UserPromptSubmit: lightweight hint reminding Claude about memory skill
+│   ├── user-prompt-submit.sh    # UserPromptSubmit: recall capability hint
 │   ├── stop.sh                  # Stop: extract last turn → summarize → lazily create heading → append (async)
 │   ├── session-end.sh           # SessionEnd: stop watch process
 │   └── parse-transcript.sh      # Last-turn extractor: finds last user question → EOF, formats with role labels for LLM (Python 3, no jq)
@@ -82,19 +82,20 @@ plugins/claude-code/
 **Three-layer progressive disclosure (all in subagent):**
 1. **L1 (search):** Subagent runs `memsearch search` to find relevant chunks
 2. **L2 (expand):** Subagent runs `memsearch expand <chunk_hash>` to get full markdown sections
-3. **L3 (transcript):** Subagent runs `python3 ${CLAUDE_PLUGIN_ROOT}/transcript.py <jsonl>` to drill into original conversations
+3. **L3 (transcript):** Subagent runs `memsearch transcript <jsonl> --turn <uuid> --context 3` to drill into original conversations (core CLI auto-detects the format; `transcript.py` remains as the plugin-local, Claude-specific parser exercised by `tests/test_transcript.py`)
 
 **Supporting hooks:**
 - `SessionStart` injects cold-start context (recent daily logs) so Claude knows history exists
-- `UserPromptSubmit` returns a lightweight `systemMessage` hint ("[memsearch] Memory available") to increase skill trigger awareness
+- `UserPromptSubmit` returns the lightweight capability hint ("[memsearch] Recall available if needed") in `systemMessage` for the user and in `hookSpecificOutput.additionalContext` for the model, to increase skill trigger awareness
 - `Stop` hook is async and non-blocking — extracts last turn only, calls `claude -p --model haiku` (with `CLAUDECODE=` to bypass nested session detection) to summarize as third-person notes, appends to daily `.md`
 
 When modifying hooks/skills, keep in mind:
-- All hooks output JSON to stdout (`additionalContext` for context injection, `systemMessage` for visible hints, or empty `{}`)
+- All hooks output JSON to stdout (`additionalContext` for context injection, `systemMessage` for visible hints, or empty `{}`); `systemMessage` is user-visible only, so a hint that also has to reach the model is returned in both fields
 - `common.sh` is sourced by every hook — changes there affect all hooks. It derives a per-project `COLLECTION_NAME` via `derive-collection.sh` and passes `--collection` automatically through `run_memsearch()` and `start_watch()`
 - The watch process uses a PID file (`.memsearch/.watch.pid`) for singleton behavior. Milvus Lite falls back to one-time `index()` at session start
 - `stop.sh` has a recursion guard (`stop_hook_active`) since it calls `claude -p` internally, and sets `MEMSEARCH_NO_WATCH=1` to prevent the child process from interfering with the main session's watch
 - The `memory-recall` skill uses `context: fork` — the subagent has its own context window and does not see main conversation history
+- Leave `model` unset in the Claude Code skills' frontmatter so users can choose a default through `CLAUDE_CODE_SUBAGENT_MODEL`. See [skill model selection](docs/platforms/claude-code/memory-recall.md#which-model-runs-the-skill) for precedence and overrides
 - `transcript.py` lives in the plugin directory (not in core library) since it is entirely Claude Code JSONL-specific
 
 ## Key Design Decisions
@@ -104,22 +105,24 @@ When modifying hooks/skills, keep in mind:
 - **ONNX bge-m3 as plugin default.** The Claude Code plugin hooks default to `onnx` provider (bge-m3, CPU, no API key). The Python API still defaults to `openai`.
 - **Hybrid search by default.** Every collection has both dense vector and BM25 sparse fields. Search uses RRF to combine them. RRF scores are normalized to `[0, 1]` (theoretical max = `num_retrievers / (k + 1)`).
 - **`[llm]` + `[prompts]` config.** New config sections for LLM provider selection and custom prompt templates. `[compact]` is deprecated but still works (fallback: `[llm]` > `[compact]` > defaults). Plugins read `prompts.summarize` for custom session summarization prompts. **Migration plan:** `[compact]` will be removed in the next major version (1.0). During the transition, `resolve_config()` emits a `DeprecationWarning` when user config files contain `[compact]`. The compact CLI command resolves LLM settings as `cfg.llm.* or cfg.compact.*`.
-- **Shared prompt template.** All four plugins share a single `summarize.txt` template (maintained in `plugins/_shared/prompts/`, synced via `scripts/sync-prompts.sh`). Template uses `{{AGENT_NAME}}` placeholder.
+- **Shared prompt template.** All five plugins share a single `summarize.txt` template (maintained in `plugins/_shared/prompts/`, synced via `scripts/sync-prompts.sh`). Template uses `{{AGENT_NAME}}` placeholder.
 - **Remote Milvus `query()` requires a filter.** Use `chunk_hash != ""` as a "match all" filter when no filter is provided (Milvus Lite doesn't enforce this, but Milvus Server does).
 
 ## Versioning & Release
 
-**Five independent version numbers** — bump only the ones that changed:
+**Six release components** — bump only the versioned components that changed:
 
 | Component | Version file | Publish channel |
 |-----------|-------------|-----------------|
 | **memsearch** (PyPI) | `pyproject.toml` | PyPI (automated via GitHub Actions on tag push) |
 | **Claude Code plugin** | `plugins/claude-code/.claude-plugin/plugin.json` | Marketplace (`.claude-plugin/marketplace.json`) |
+| **Codex plugin** | *(none)* | `install.sh` (no version management) |
+| **DeepSeek Harness plugin** | `plugins/dsh/package.json` | npm (`@zilliz/memsearch-dsh`, trusted publishing via `release-dsh.yml`) |
 | **OpenClaw plugin** | `plugins/openclaw/package.json` | ClawHub (`clawhub package publish`) |
-| **OpenCode plugin** | `plugins/opencode/package.json` | npm (`@zilliz/memsearch-opencode`) |
-| **Codex CLI plugin** | *(none)* | `install.sh` (no version management) |
+| **OpenCode plugin** | `plugins/opencode/package.json` | npm (`@zilliz/memsearch-opencode`, trusted publishing via `release.yml`) |
 
-See `CLAUDE.local.md` for detailed release procedures, current versions, and operational details.
+Use the repository-local `$release-memsearch` skill for release operations. See
+`CLAUDE.local.md` for machine-specific development and published-artifact E2E rules.
 
 ## Project Conventions
 

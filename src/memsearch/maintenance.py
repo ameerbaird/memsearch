@@ -551,11 +551,15 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 
 def _run_restricted(argv: list[str], cwd: Path) -> str:
+    text_options = {}
+    if Path(argv[0]).name.lower() in {"memsearch", "memsearch.exe"}:
+        text_options = {"encoding": "utf-8", "errors": "strict"}
     try:
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
+            **text_options,
             cwd=str(cwd),
             env={**os.environ, "MEMSEARCH_NO_WATCH": "1"},
             timeout=15,
@@ -572,10 +576,75 @@ def _parse_task_response(raw: str) -> dict[str, str]:
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         text = match.group(1)
+
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Maintenance LLM did not return valid JSON: {e}") from e
+    except json.JSONDecodeError as initial_error:
+        decoder = json.JSONDecoder()
+        last_object: dict[str, Any] | None = None
+        last_action_object: dict[str, Any] | None = None
+
+        cursor = 0
+        while True:
+            brace = text.find("{", cursor)
+            bracket = text.find("[", cursor)
+            starts = [position for position in (brace, bracket) if position >= 0]
+            if not starts:
+                break
+            start = min(starts)
+
+            try:
+                candidate, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                stack: list[str] = []
+                in_string = False
+                escaped = False
+                balanced_end: int | None = None
+
+                for index in range(start, len(text)):
+                    char = text[index]
+
+                    if in_string:
+                        if escaped:
+                            escaped = False
+                        elif char == "\\":
+                            escaped = True
+                        elif char == '"':
+                            in_string = False
+                        continue
+
+                    if char == '"':
+                        in_string = True
+                    elif char in "{[":
+                        stack.append(char)
+                    elif char in "}]":
+                        expected = "{" if char == "}" else "["
+                        if not stack or stack[-1] != expected:
+                            break
+                        stack.pop()
+                        if not stack:
+                            balanced_end = index + 1
+                            break
+
+                if balanced_end is None:
+                    break
+
+                cursor = balanced_end
+                continue
+
+            cursor = end
+
+            if not isinstance(candidate, dict):
+                continue
+
+            last_object = candidate
+            if "action" in candidate:
+                last_action_object = candidate
+
+        data = last_action_object or last_object
+        if data is None:
+            raise RuntimeError(f"Maintenance LLM did not return valid JSON: {initial_error}") from initial_error
+
     action = data.get("action")
     if action not in {"none", "replace"}:
         raise RuntimeError("Maintenance LLM action must be 'none' or 'replace'")

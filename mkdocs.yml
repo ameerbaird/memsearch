@@ -41,6 +41,7 @@ nav:
     - Design Philosophy: design-philosophy.md
     - Comparison with Alternatives: home/comparison.md
     - Embedding Model Evaluation: home/embedding-evaluation.md
+    - Reranking Evaluation: https://github.com/zilliztech/memsearch/blob/main/evaluation/reranking-evaluation.md
     - Quickstart: getting-started.md
     - FAQ: faq.md
     - Troubleshooting: troubleshooting.md
@@ -50,6 +51,15 @@ nav:
     - How It Works: platforms/claude-code/how-it-works.md
     - Memory Recall: platforms/claude-code/memory-recall.md
     - Troubleshooting: platforms/claude-code/troubleshooting.md
+  - Codex Plugin:
+    - Overview: platforms/codex/index.md
+    - Installation: platforms/codex/installation.md
+    - How It Works: platforms/codex/how-it-works.md
+    - Memory Recall: platforms/codex/memory-recall.md
+  - DeepSeek Harness Plugin:
+    - Overview: platforms/dsh/index.md
+    - Installation: platforms/dsh/installation.md
+    - How It Works: platforms/dsh/how-it-works.md
   - OpenClaw Plugin:
     - Overview: platforms/openclaw/index.md
     - Installation: platforms/openclaw/installation.md
@@ -60,11 +70,6 @@ nav:
     - Installation: platforms/opencode/installation.md
     - How It Works: platforms/opencode/how-it-works.md
     - Memory Tools: platforms/opencode/memory-tools.md
-  - Codex CLI Plugin:
-    - Overview: platforms/codex/index.md
-    - Installation: platforms/codex/installation.md
-    - How It Works: platforms/codex/how-it-works.md
-    - Memory Recall: platforms/codex/memory-recall.md
   - For Agent Developers:
     - CLI Reference: cli.md
     - Python API: python-api.md

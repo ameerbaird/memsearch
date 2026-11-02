@@ -2,11 +2,30 @@
 
 memsearch uses a layered TOML config system. Most users don't need to configure anything — the defaults work out of the box.
 
-## Config Locations (priority low → high)
+## Config Sources (priority low → high)
 
-1. `~/.memsearch/config.toml` — global defaults
-2. `<project>/.memsearch.toml` — project-level overrides
-3. CLI flags — highest priority
+1. Built-in defaults
+2. Integration defaults such as a plugin's directory-derived collection
+3. `~/.memsearch/config.toml` — global defaults
+4. `<project>/.memsearch.toml` — project-level overrides
+5. Explicit CLI flags or Python call arguments — highest priority
+
+Plugins pass their derived collection through `--default-collection`, so an
+explicit `[milvus].collection` in the project config overrides the derived
+name, and an explicit global collection overrides it when the project does not
+set one. An explicit `--collection` remains highest priority.
+
+The current Claude Code, Codex, OpenCode, OpenClaw, and DSH plugins require a
+memsearch core that exposes `--default-collection`. If that capability is not
+available, the plugin reports an incompatibility before running collection
+data operations; upgrade the core and plugin together. Existing CLI commands
+that do not use this integration-only flag remain unchanged.
+
+By default, ordinary repositories and linked Git worktrees use different
+directory-derived collections. To share indexed memory, set the same
+`[milvus].collection` value explicitly in each project's `.memsearch.toml` (or
+in global config when all projects should share it). Memsearch does not merge
+worktree scopes or migrate previously derived collections automatically.
 
 Since v0.4.11, project-level `.memsearch.toml` is intentionally restricted
 before it is merged. It can only set low-risk local indexing keys:
@@ -26,6 +45,37 @@ memsearch config init
 memsearch config set embedding.provider onnx
 memsearch config set milvus.uri http://localhost:19530
 ```
+
+## Optional remote reranking
+
+Reranking is off by default (`reranker.model = ""`). Enable Jev explicitly in
+your trusted global configuration:
+
+```bash
+export TYPESAFE_API_KEY="your-key"
+memsearch config set reranker.model jev:jev-latest
+```
+
+The equivalent setting in `~/.memsearch/config.toml` is:
+
+```toml
+[reranker]
+model = "jev:jev-latest"
+```
+
+`jev-latest` follows the latest stable release, matching the [official SDK default](https://docs.typesafe.ai/models#aliases). To keep a specific version, use `jev:jev-1.13.0` instead. The published evaluation remains pinned to that version.
+
+This sends search queries and retrieved chunk text to the TypeSafe API. It does
+not change the embedding provider or require reindexing. Project-local config
+cannot enable this remote provider. To disable reranking:
+
+```bash
+memsearch config set reranker.model ""
+```
+
+Local cross-encoder model IDs continue to use the existing ONNX/PyTorch
+backends. See [reranking evaluation](https://github.com/zilliztech/memsearch/blob/main/evaluation/reranking-evaluation.md) for results and
+[Python API](../python-api.md#optional-jev-reranking) for programmatic use.
 
 ## Index Exclusions
 
@@ -70,9 +120,14 @@ memsearch index docs/ --exclude 'generated/**' --exclude '*.draft.md'
 
 ## Embedding Provider
 
+The Claude Code, Codex, OpenClaw, OpenCode, and DSH plugins select ONNX when no
+configuration exists and preserve existing configuration. The CLI defaults to
+OpenAI. The Python API also defaults to OpenAI and takes its settings directly
+as constructor arguments, such as `embedding_provider="onnx"` for local embeddings.
+
 | Provider | Install | API Key | Notes |
 |----------|---------|---------|-------|
-| **onnx** (default) | `pip install memsearch[onnx]` | No | Local, free, ~100MB model download |
+| **onnx** | `pip install memsearch[onnx]` | No | Local, free, ~558 MB model download |
 | openai | `pip install memsearch[openai]` | `OPENAI_API_KEY` | Best quality |
 | google | `pip install memsearch[google]` | `GOOGLE_API_KEY` | Gemini embeddings |
 | voyage | `pip install memsearch[voyage]` | `VOYAGE_API_KEY` | High quality |
@@ -286,4 +341,4 @@ Each plugin may have additional configuration. See:
 - [Claude Code Plugin](../platforms/claude-code/index.md)
 - [OpenClaw Plugin](../platforms/openclaw/index.md)
 - [OpenCode Plugin](../platforms/opencode/index.md)
-- [Codex CLI Plugin](../platforms/codex/index.md)
+- [Codex Plugin](../platforms/codex/index.md)

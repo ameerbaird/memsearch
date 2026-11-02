@@ -189,7 +189,7 @@ The ONNX bge-m3 int8 model (~558 MB) downloads from HuggingFace Hub on first use
 
 - First session hangs after sending a prompt
 - `memsearch search` or `memsearch index` hang on first run
-- `[memsearch] Memory available` appears but recall returns no results
+- `[memsearch] Recall available if needed` appears but recall returns no results
 
 **Pre-download:**
 ```bash
@@ -216,4 +216,4 @@ After the first download, the model is cached at `~/.cache/huggingface/hub/` and
 | Skill never triggers automatically | Manual `/memory-recall` test | Ensure prompt >= 10 chars; memsearch in PATH |
 | First session hangs | ONNX model downloading | Pre-download with warmup command |
 | Session summaries missing | Check `claude` CLI availability | Verify `claude` is in PATH |
-| Stale stats count | Normal for Milvus Server | Stats update after flush/compaction; search is always up-to-date |
+| Stale stats count | Normal for Milvus Server | Stats update after flush/compaction; a zero count no longer blocks growing-only search, while new rows in mixed collections still follow Milvus search consistency |

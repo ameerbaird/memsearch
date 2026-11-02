@@ -44,6 +44,8 @@ def test_default_config():
     assert cfg.plugins.codex.project_review.input_dir == ".memsearch/memory"
     assert cfg.plugins.codex.project_review.output_file == ".memsearch/PROJECT.md"
     assert cfg.plugins.codex.user_profile.output_file == ".memsearch/USER.md"
+    assert cfg.plugins.dsh.summarize.provider == ""
+    assert cfg.plugins.dsh.summarize.model == ""
 
 
 def test_load_toml_file(tmp_path: Path):
@@ -127,6 +129,32 @@ def test_resolve_priority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # Untouched fields remain default
     assert cfg.embedding.provider == "openai"
     assert cfg.chunking.max_chunk_size == 1500
+
+
+def test_collection_priority_includes_caller_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Caller defaults must not mask global, project, or explicit call values."""
+    global_cfg = tmp_path / "global.toml"
+    project_cfg = tmp_path / ".memsearch.toml"
+    monkeypatch.setattr("memsearch.config.GLOBAL_CONFIG_PATH", global_cfg)
+    monkeypatch.setattr("memsearch.config.PROJECT_CONFIG_PATH", project_cfg)
+    caller_default = {"milvus": {"collection": "derived_collection"}}
+
+    cfg = resolve_config(default_overrides=caller_default)
+    assert cfg.milvus.collection == "derived_collection"
+
+    save_config({"milvus": {"collection": "global_collection"}}, global_cfg)
+    cfg = resolve_config(default_overrides=caller_default)
+    assert cfg.milvus.collection == "global_collection"
+
+    save_config({"milvus": {"collection": "project_collection"}}, project_cfg)
+    cfg = resolve_config(default_overrides=caller_default)
+    assert cfg.milvus.collection == "project_collection"
+
+    cfg = resolve_config(
+        {"milvus": {"collection": "explicit_collection"}},
+        default_overrides=caller_default,
+    )
+    assert cfg.milvus.collection == "explicit_collection"
 
 
 def test_project_config_cannot_override_trusted_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -254,12 +282,14 @@ def test_plugin_summarize_model_config_roundtrip(tmp_path: Path, monkeypatch: py
     set_config_value("plugins.codex.summarize.model", "gpt-5.1-codex-mini")
     set_config_value("plugins.opencode.summarize.model", "anthropic/claude-haiku")
     set_config_value("plugins.openclaw.summarize.model", "qwen3-coder")
+    set_config_value("plugins.dsh.summarize.model", "deepseek-v4-flash")
 
     cfg = resolve_config()
     assert cfg.plugins.claude_code.summarize.model == "claude-haiku-4-5"
     assert cfg.plugins.codex.summarize.model == "gpt-5.1-codex-mini"
     assert cfg.plugins.opencode.summarize.model == "anthropic/claude-haiku"
     assert cfg.plugins.openclaw.summarize.model == "qwen3-coder"
+    assert cfg.plugins.dsh.summarize.model == "deepseek-v4-flash"
     assert get_config_value("plugins.claude-code.summarize.model", cfg) == "claude-haiku-4-5"
 
     saved = load_config_file(cfg_path)
